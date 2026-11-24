@@ -8,7 +8,7 @@ Kite 是一个使用 Rust 构建的跨平台端到端加密（E2EE）文件与�
  Linux 客户端          Windows 客户端          Android 客户端（M4）
       │                      │                        │
       └──────────────────────┼────────────────────────┘
-                             │ HTTPS / TLS（REST）
+                             │ HTTPS / TLS 1.3（REST）
                     ┌────────▼────────┐
                     │   Kite Server   │
                     │  Rust / axum    │
@@ -70,10 +70,10 @@ docker compose -f docker/docker-compose.yml down
 ### 已支持
 
 - **设备身份**：Ed25519 身份；`device_id` 为身份公钥 SHA-256 前 16 字节的小写 hex；默认设备名为 `{hostname}-{os}-{公钥前4字节hex}`。
-- **端到端加密**：X3DH 4DH，以及 OPK 池耗尽后的 3DH 回退；可序列化的 Double Ratchet 会话，支持乱序消息与重启恢复。
-- **客户端能力**：TLS 证书指纹锁定；注册、设备发现、通过加密信封异步配对、E2EE 文本消息收发、离线消息补投；SQLite 持久化身份、配对状态、棘轮会话和每设备同步游标。
-- **服务端 API**：REST over TLS，支持 rcgen 自签证书或外部 PEM；Ed25519 注册签名（`register||device_id||name`）、挑战应答认证、设备目录、预密钥包与一次性 OPK。
-- **信箱与配对中继**：每设备单调递增序号、高水位 `since` 游标同步、ACK 删除、最长 25 秒长轮询、`pair_req` / `pair_resp` 离线中继。
+- **端到端加密**：X3DH 4DH，以及 OPK 池耗尽后的 3DH 回退；可序列化的 Double Ratchet 会话，支持乱序消息与重启恢复。已消费的 OPK 不会静默降级为 3DH。
+- **客户端能力**：仅 TLS 1.3、证书指纹锁定；注册、设备发现、通过加密信封异步配对、E2EE 文本消息收发、离线消息补投；SQLite 原子持久化身份、配对状态、棘轮会话、信箱处置和同步游标。原始硬件标识在客户端经随机盐 Argon2id 哈希为 PHC 字符串，服务端只保存该字符串。重复/恶意信箱项记录失败并跳过，不会阻塞后续消息。
+- **服务端 API**：REST over TLS 1.3，支持 rcgen 自签证书或外部 PEM；Ed25519 注册签名（`register||device_id||name`）、挑战应答认证、设备目录、预密钥包与一次性 OPK。任一成功的 Bearer 认证刷新在线活动，90 秒无活动后目录显示离线。
+- **信箱与配对中继**：每设备单调递增序号、高水位 `since` 游标同步、ACK 删除、最长 25 秒长轮询、`pair_req` / `pair_resp` 离线中继。配对信封采用 ±120 秒时间窗和持久化 EK 重放缓存；已有会话的重复配对请求不会替换现有会话。
 - **运维**：HTTPS `/healthz`、独立明文 `/healthz` 探针、带认证的 `/stats`、SQLite 持久化、Docker 多阶段构建与 Compose 部署。
 
 ### 尚未支持
@@ -86,6 +86,8 @@ docker compose -f docker/docker-compose.yml down
 
 `KITE_MAX_STORAGE_BYTES` 当前仅解析并在启动时打印，M1 不据此淘汰或拒绝信箱数据。
 
+> **本地密钥存储限制**：M1 的客户端 SQLite 存放身份私钥和棘轮密钥；目前仅在 Unix 上强制目录 `0700`、数据库文件 `0600`（其他平台为 best-effort no-op）。这**尚未满足**设计要求的平台安全存储；Keyring / DPAPI / Android Keystore 集成推迟到 M3+，在此之前数据库文件失窃仍会暴露密钥材料。
+
 ## 服务端配置
 
 | 环境变量 | 默认值 | 说明 |
@@ -97,7 +99,7 @@ docker compose -f docker/docker-compose.yml down
 | `KITE_TLS_KEY` | 未设置 | 外部 PEM 私钥路径；必须与 `KITE_TLS_CERT` 同时设置 |
 | `KITE_HEALTH_BIND` | `0.0.0.0:8444` | 明文 HTTP `/healthz` 探针监听地址 |
 
-未同时设置证书和私钥路径时，服务端生成 rcgen 自签证书。无效配置会在启动时直接报错。
+未同时设置证书和私钥路径时，服务端生成 rcgen 自签证书。**默认自签证书每次重启都会改变 SHA-256 指纹**，指纹锁定的客户端需随之更新；稳定部署应设置 `KITE_TLS_CERT` / `KITE_TLS_KEY` 并妥善轮换。无效配置会在启动时直接报错。
 
 ## 设计文档
 

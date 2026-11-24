@@ -10,4 +10,4 @@ services:
     environment:
       KITE_BIND: 0.0.0.0:8443
       KITE_DB_PATH: /data/kite.db
-      KITE_MAX_STORAGE_BYTES: ${KITE_MAX_STORAGE_BYTES:-}
+      KITE_MAX_STORAGE_BYTES: ${KITE_MAX_STORAGE_BYTES:-10737418240}
