@@ -1,0 +1,11 @@
+FROM rust:1-slim AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --locked --release -p kite-server
+
+# Match the builder's Debian release so the binary's glibc requirement is met.
+FROM debian:trixie-slim AS runtime
+COPY --from=builder /build/target/release/kite-server /usr/local/bin/kite-server
+ENV KITE_BIND=0.0.0.0:8443
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/kite-server"]

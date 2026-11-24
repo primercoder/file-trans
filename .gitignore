@@ -10,6 +10,7 @@ node_modules/
 target/
 dist/
 build/
+data/
 __pycache__/
 *.pyc
 .dart_tool/
