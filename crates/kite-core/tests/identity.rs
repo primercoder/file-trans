@@ -1,5 +1,14 @@
 use kite_core::{HwInfo, Identity};
 
+const PRIVATE_KEY_A: &str = "-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f
+-----END PRIVATE KEY-----
+";
+const PRIVATE_KEY_B: &str = "-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g
+-----END PRIVATE KEY-----
+";
+
 fn hw_info() -> HwInfo {
     HwInfo {
         hostname: "office".to_owned(),
@@ -40,12 +49,22 @@ fn private_pem_roundtrip_preserves_device_id() {
 
 #[test]
 fn default_device_name_uses_identity_suffix() {
-    let identity = Identity::generate();
-    let other = Identity::generate();
+    let identity = Identity::from_private(PRIVATE_KEY_A).unwrap();
+    let other = Identity::from_private(PRIVATE_KEY_B).unwrap();
 
     assert_ne!(
         identity.default_device_name(&hw_info()),
         other.default_device_name(&hw_info())
+    );
+}
+
+#[test]
+fn default_device_name_has_exact_format() {
+    let identity = Identity::from_private(PRIVATE_KEY_A).unwrap();
+
+    assert_eq!(
+        identity.default_device_name(&hw_info()),
+        "office-Linux-03a107bf"
     );
 }
 

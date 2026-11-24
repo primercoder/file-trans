@@ -12,7 +12,7 @@ pub struct HwInfo {
 }
 
 impl Identity {
-    /// Builds `{hostname}-{os}-{suffix}` using four hex characters from the public key.
+    /// Builds `{hostname}-{os}-{suffix}` using the public key's first four bytes as hex.
     pub fn default_device_name(&self, hw: &HwInfo) -> String {
         let verifying_key = self.verifying_key();
         let public_key = verifying_key.as_bytes();
@@ -20,7 +20,7 @@ impl Identity {
             "{}-{}-{}",
             hw.hostname,
             hw.os,
-            hex::encode(&public_key[..2])
+            hex::encode(&public_key[..4])
         )
     }
 }
