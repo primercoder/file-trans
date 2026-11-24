@@ -92,13 +92,13 @@ pub fn decode_signature(value: &str) -> Result<ed25519_dalek::Signature, ApiErro
     Ok(ed25519_dalek::Signature::from_bytes(&bytes))
 }
 
-pub fn token() -> String {
+pub fn token() -> Result<String, ApiError> {
     use rand::{TryRngCore as _, rngs::OsRng};
     let mut bytes = [0_u8; 32];
     OsRng
         .try_fill_bytes(&mut bytes)
-        .expect("operating system randomness must be available");
-    hex::encode(bytes)
+        .map_err(|error| ApiError::internal(format!("OS randomness unavailable: {error}")))?;
+    Ok(hex::encode(bytes))
 }
 
 pub fn token_hash(token: &str) -> String {
@@ -106,11 +106,12 @@ pub fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-pub fn unix_time() -> i64 {
-    std::time::SystemTime::now()
+pub fn unix_time() -> Result<i64, ApiError> {
+    let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock must be after the Unix epoch")
-        .as_secs() as i64
+        .map_err(|error| ApiError::internal(format!("system clock before Unix epoch: {error}")))?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| ApiError::internal("system time exceeds i64 seconds"))
 }
 
 #[derive(Serialize)]

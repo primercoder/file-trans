@@ -72,9 +72,9 @@ pub async fn register(
     for opk in &request.opks {
         opks.push((opk.id, decode_base64::<32>(&opk.key, "opks.key")?.to_vec()));
     }
-    let token = token();
+    let token = token()?;
     let hash = token_hash(&token);
-    let now = unix_time();
+    let now = unix_time()?;
     let connection = state.db.0.lock().await;
     let transaction = connection.unchecked_transaction()?;
     let existing: Option<Vec<u8>> = transaction
@@ -179,7 +179,7 @@ pub async fn challenge(
     if exists.is_none() {
         return Err(ApiError::not_found());
     }
-    let nonce = token();
+    let nonce = token()?;
     state.pending_challenges.lock().await.insert(
         request.device_id,
         (nonce.clone(), Instant::now() + Duration::from_secs(300)),
@@ -236,10 +236,10 @@ pub async fn verify(
         &decode_signature(&request.sig)?,
     )
     .map_err(|_| ApiError::unauthorized("invalid challenge signature"))?;
-    let token = token();
+    let token = token()?;
     state.db.0.lock().await.execute(
         "UPDATE devices SET token_hash = ?1, last_seen = ?2 WHERE device_id = ?3",
-        params![token_hash(&token), unix_time(), request.device_id],
+        params![token_hash(&token), unix_time()?, request.device_id],
     )?;
     Ok(Json(TokenResponse {
         token,

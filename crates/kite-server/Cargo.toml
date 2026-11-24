@@ -12,8 +12,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rcgen = "0.14"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-ed25519-dalek = { version = "2", features = ["pem", "pkcs8"] }
+ed25519-dalek = { version = "3", features = ["pem", "pkcs8"] }
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
@@ -23,4 +22,5 @@ rand = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
