@@ -24,6 +24,7 @@ pub enum CryptoError {
     ZeroDh,
     InvalidKey,
     HkdfLength,
+    EncryptFailed,
     DecryptFailed,
     SkippedLimit,
     InvalidMessage,

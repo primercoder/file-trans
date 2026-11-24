@@ -95,6 +95,34 @@ fn skipped_message_key_cache_is_capped() {
     assert!(bob.decrypt(&messages[65], b"ad").is_err());
 }
 
+#[test]
+fn restored_session_preserves_skipped_keys_and_continues_both_directions() {
+    let (mut alice, mut bob) = sessions();
+    let first = alice.encrypt(b"first", b"ad").unwrap();
+    let second = alice.encrypt(b"second", b"ad").unwrap();
+    assert_eq!(bob.decrypt(&second, b"ad").unwrap(), b"second");
+
+    let encoded = bincode::serialize(&bob).unwrap();
+    let mut restored_bob: Session = bincode::deserialize(&encoded).unwrap();
+    assert_eq!(restored_bob.decrypt(&first, b"ad").unwrap(), b"first");
+
+    let bob_reply = restored_bob.encrypt(b"restored bob", b"reply-ad").unwrap();
+    let encoded_alice = bincode::serialize(&alice).unwrap();
+    let mut restored_alice: Session = bincode::deserialize(&encoded_alice).unwrap();
+    assert_eq!(
+        restored_alice.decrypt(&bob_reply, b"reply-ad").unwrap(),
+        b"restored bob"
+    );
+
+    let alice_reply = restored_alice
+        .encrypt(b"restored alice", b"last-ad")
+        .unwrap();
+    assert_eq!(
+        restored_bob.decrypt(&alice_reply, b"last-ad").unwrap(),
+        b"restored alice"
+    );
+}
+
 fn clone_message(message: &RatchetMessage) -> RatchetMessage {
     RatchetMessage {
         ratchet_pub: message.ratchet_pub,

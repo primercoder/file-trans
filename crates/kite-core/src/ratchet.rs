@@ -21,6 +21,7 @@ use crate::CryptoError;
 const MAX_SKIPPED_KEYS: usize = 64;
 const ROOT_INFO: &[u8] = b"kite-double-ratchet-root-v1";
 const CHAIN_INFO: &[u8] = b"kite-double-ratchet-chain-v1";
+type SkippedMessageKey = (([u8; 32], u32), [u8; 32]);
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RatchetMessage {
@@ -42,6 +43,75 @@ pub struct Session {
     recv_seq: u32,
     prev_chain_len: u32,
     skipped_keys: BTreeMap<([u8; 32], u32), [u8; 32]>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializedSession {
+    session_ad: Vec<u8>,
+    root_key: [u8; 32],
+    own_ratchet: [u8; 32],
+    remote_ratchet_pub: Option<[u8; 32]>,
+    sending_chain: Option<[u8; 32]>,
+    receiving_chain: Option<[u8; 32]>,
+    send_seq: u32,
+    recv_seq: u32,
+    prev_chain_len: u32,
+    skipped_keys: Vec<SkippedMessageKey>,
+}
+
+impl Serialize for Session {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        SerializedSession {
+            session_ad: self.session_ad.clone(),
+            root_key: self.root_key,
+            own_ratchet: self.own_ratchet.to_bytes(),
+            remote_ratchet_pub: self.remote_ratchet_pub,
+            sending_chain: self.sending_chain,
+            receiving_chain: self.receiving_chain,
+            send_seq: self.send_seq,
+            recv_seq: self.recv_seq,
+            prev_chain_len: self.prev_chain_len,
+            skipped_keys: self
+                .skipped_keys
+                .iter()
+                .map(|(id, key)| (*id, *key))
+                .collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Session {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let state = SerializedSession::deserialize(deserializer)?;
+        if state.skipped_keys.len() > MAX_SKIPPED_KEYS {
+            return Err(serde::de::Error::custom("too many skipped message keys"));
+        }
+        let mut skipped_keys = BTreeMap::new();
+        for (id, key) in state.skipped_keys {
+            if skipped_keys.insert(id, key).is_some() {
+                return Err(serde::de::Error::custom("duplicate skipped message key"));
+            }
+        }
+        Ok(Session {
+            session_ad: state.session_ad,
+            root_key: state.root_key,
+            own_ratchet: StaticSecret::from(state.own_ratchet),
+            remote_ratchet_pub: state.remote_ratchet_pub,
+            sending_chain: state.sending_chain,
+            receiving_chain: state.receiving_chain,
+            send_seq: state.send_seq,
+            recv_seq: state.recv_seq,
+            prev_chain_len: state.prev_chain_len,
+            skipped_keys,
+        })
+    }
 }
 
 impl Session {
@@ -131,7 +201,7 @@ impl Session {
                     aad: &aad,
                 },
             )
-            .map_err(|_| CryptoError::DecryptFailed)?;
+            .map_err(|_| CryptoError::EncryptFailed)?;
         Ok(RatchetMessage {
             ratchet_pub: Some(ratchet_pub),
             header_seq,

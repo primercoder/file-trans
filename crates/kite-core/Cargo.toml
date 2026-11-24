@@ -13,3 +13,6 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 hkdf = "0.12"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
+
+[dev-dependencies]
+bincode = "1"
