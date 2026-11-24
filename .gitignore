@@ -1,0 +1,21 @@
+# 参考项目(仅本地学习用,不入库)
+reference/
+
+# 通用
+.DS_Store
+*.log
+.env
+.env.local
+node_modules/
+target/
+dist/
+build/
+__pycache__/
+*.pyc
+.dart_tool/
+.packages
+.flutter-plugins*
+.idea/
+.vscode/
+*.iml
+coverage/
