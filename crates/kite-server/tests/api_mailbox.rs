@@ -298,10 +298,12 @@ impl Drop for ChildServer {
     }
 }
 
+#[allow(clippy::zombie_processes)] // ChildServer::drop kills and waits on every normal return path.
 async fn spawn_process(db: &std::path::Path, port: u16) -> ChildServer {
     let child = Command::new(env!("CARGO_BIN_EXE_kite-server"))
         .env("KITE_BIND", format!("127.0.0.1:{port}"))
         .env("KITE_DB_PATH", db)
+        .env("KITE_HEALTH_BIND", "127.0.0.1:0")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

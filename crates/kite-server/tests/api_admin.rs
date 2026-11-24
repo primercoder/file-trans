@@ -113,6 +113,7 @@ impl Drop for ChildServer {
     }
 }
 
+#[allow(clippy::zombie_processes)] // ChildServer::drop kills and waits on every normal return path.
 async fn spawn_process(db: &std::path::Path, port: u16) -> ChildServer {
     let health_port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()

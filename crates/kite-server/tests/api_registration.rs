@@ -50,9 +50,15 @@ struct Server {
 }
 
 async fn spawn_server() -> Server {
+    spawn_server_with_grace(std::time::Duration::from_secs(90)).await
+}
+
+async fn spawn_server_with_grace(online_grace: std::time::Duration) -> Server {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("kite.db");
-    let app = kite_server::router_with_db(&db_path).await.unwrap();
+    let mut state = kite_server::state::AppState::new(kite_server::db::Db::open(&db_path).unwrap());
+    state.online_grace = online_grace;
+    let app = kite_server::router(state);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -140,9 +146,9 @@ async fn registration_login_directory_and_opk_lifecycle() {
         .unwrap();
     let devices = devices.as_array().unwrap();
     assert_eq!(devices.len(), 2);
-    for id in [&a.device_id, &_b.device_id] {
+    for (id, expected_online) in [(&a.device_id, true), (&_b.device_id, false)] {
         let device = devices.iter().find(|d| &d["device_id"] == id).unwrap();
-        assert_eq!(device["online"], false);
+        assert_eq!(device["online"], expected_online);
         assert!(device["last_seen"].is_i64() || device["last_seen"].is_u64());
     }
     let detail: Value = server
@@ -208,6 +214,31 @@ async fn registration_login_directory_and_opk_lifecycle() {
         .unwrap();
     assert!(bundle.get("opk").is_none());
     assert!(bundle.get("opk_id").is_none());
+}
+
+#[tokio::test]
+async fn authenticated_activity_expires_from_presence() {
+    let server = spawn_server_with_grace(std::time::Duration::ZERO).await;
+    let (device, body) = Device::new("Alice");
+    let (_, registered) = register(&server, &body).await;
+    let token = registered["token"].as_str().unwrap();
+    let detail: Value = server
+        .client
+        .get(format!(
+            "{}/api/v1/devices/{}",
+            server.base, device.device_id
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["online"], false,
+        "zero grace makes even current activity expire at read"
+    );
 }
 
 #[tokio::test]

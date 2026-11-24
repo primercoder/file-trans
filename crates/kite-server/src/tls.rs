@@ -1,4 +1,4 @@
-use std::{error::Error, fs, path::Path};
+use std::{error::Error, fs, path::Path, sync::Arc};
 
 use axum_server::tls_rustls::RustlsConfig;
 use sha2::{Digest as _, Sha256};
@@ -18,7 +18,7 @@ pub async fn self_signed() -> Result<DevelopmentTls, Box<dyn Error>> {
     let cert_der = certified.cert.der().to_vec();
     let key_der = certified.signing_key.serialize_der();
     let fingerprint = hex::encode(Sha256::digest(&cert_der));
-    let config = RustlsConfig::from_der(vec![cert_der.clone()], key_der).await?;
+    let config = tls13_config(RustlsConfig::from_der(vec![cert_der.clone()], key_der).await?)?;
     Ok(DevelopmentTls {
         config,
         cert_der,
@@ -37,12 +37,22 @@ pub async fn from_pem_files(cert: &Path, key: &Path) -> Result<DevelopmentTls, B
         .transpose()?
         .ok_or("KITE_TLS_CERT contains no PEM certificate")?;
     let fingerprint = hex::encode(Sha256::digest(&leaf));
-    let config = RustlsConfig::from_pem_file(cert, key).await?;
+    let config = tls13_config(RustlsConfig::from_pem_file(cert, key).await?)?;
     Ok(DevelopmentTls {
         config,
         cert_der: leaf.to_vec(),
         fingerprint,
     })
+}
+
+fn tls13_config(base: RustlsConfig) -> Result<RustlsConfig, Box<dyn Error>> {
+    let provider = rustls::crypto::ring::default_provider();
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_cert_resolver(base.get_inner().cert_resolver.clone());
+    config.alpn_protocols = base.get_inner().alpn_protocols.clone();
+    Ok(RustlsConfig::from_config(Arc::new(config)))
 }
 
 pub fn write_fingerprint(db_path: &Path, fingerprint: &str) -> Result<(), Box<dyn Error>> {

@@ -39,11 +39,14 @@ pub async fn list(
             .collect::<Result<Vec<_>, _>>()?
     };
     let online = state.online.lock().await;
+    let now = std::time::Instant::now();
     Ok(Json(
         devices
             .into_iter()
             .map(|(device_id, name, last_seen)| DeviceDto {
-                online: online.contains_key(&device_id),
+                online: online
+                    .get(&device_id)
+                    .is_some_and(|at| now.duration_since(*at) < state.online_grace),
                 device_id,
                 name,
                 last_seen,
@@ -76,7 +79,12 @@ pub async fn get(
         )
         .optional()?
         .ok_or_else(ApiError::not_found)?;
-    let online = state.online.lock().await.contains_key(&device.0);
+    let online = state
+        .online
+        .lock()
+        .await
+        .get(&device.0)
+        .is_some_and(|at| at.elapsed() < state.online_grace);
     Ok(Json(DeviceDto {
         device_id: device.0,
         name: device.1,

@@ -140,7 +140,7 @@ pub async fn bearer(state: &AppState, headers: &HeaderMap) -> Result<String, Api
         .strip_prefix("Bearer ")
         .filter(|token| token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| ApiError::unauthorized("invalid bearer token"))?;
-    let device_id = state
+    let device_id: String = state
         .db
         .0
         .lock()
@@ -152,6 +152,16 @@ pub async fn bearer(state: &AppState, headers: &HeaderMap) -> Result<String, Api
         )
         .optional()?
         .ok_or_else(|| ApiError::unauthorized("invalid bearer token"))?;
+    // Every successful bearer authentication is activity for M1 presence.
+    state.db.0.lock().await.execute(
+        "UPDATE devices SET last_seen=?1 WHERE device_id=?2",
+        rusqlite::params![unix_time()?, device_id],
+    )?;
+    state
+        .online
+        .lock()
+        .await
+        .insert(device_id.clone(), Instant::now());
     Ok(device_id)
 }
 
