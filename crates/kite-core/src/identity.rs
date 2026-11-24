@@ -1,6 +1,6 @@
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::{TryRngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
 
@@ -47,6 +47,16 @@ impl Identity {
             .expect("serializing an Ed25519 public key cannot fail")
     }
 
+    /// Returns the raw 32-byte Ed25519 public key.
+    pub fn ed25519_public_key(&self) -> [u8; 32] {
+        self.verifying_key().to_bytes()
+    }
+
+    /// Signs a message with this identity's Ed25519 private key.
+    pub fn sign_bytes(&self, message: &[u8]) -> [u8; 64] {
+        self.signing_key.sign(message).to_bytes()
+    }
+
     /// Returns the device ID: lowercase hex of the first 16 bytes of SHA-256(public key).
     pub fn device_id(&self) -> String {
         let digest = Sha256::digest(self.verifying_key().as_bytes());
@@ -55,6 +65,10 @@ impl Identity {
 
     pub(crate) fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
+    }
+
+    pub(crate) fn signing_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
     }
 }
 
