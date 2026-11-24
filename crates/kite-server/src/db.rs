@@ -37,6 +37,10 @@ impl Db {
                 UNIQUE(owner_id, seq),
                 FOREIGN KEY(owner_id) REFERENCES devices(device_id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS owner_seq (
+                owner_id TEXT PRIMARY KEY,
+                last_seq INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS opk_pool (
                 owner_id TEXT NOT NULL,
                 opk_id INTEGER NOT NULL,

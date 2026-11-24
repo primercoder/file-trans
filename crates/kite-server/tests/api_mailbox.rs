@@ -169,22 +169,29 @@ async fn send_cursor_ack_offline_and_validation() {
     assert_eq!(deleted["deleted"], 2);
     assert!(sync(&server, &b, 0).await.is_empty());
 
+    let (_, body) = send(&server, &a, &b.id, "message", b"three", now()).await;
+    assert_eq!(body["seq"], 3, "ACK must not reset the cursor sequence");
+    let entries = sync(&server, &b, 2).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["seq"], 3);
+
     send(&server, &a, &c.id, "message", b"offline", now()).await;
     let entries = sync(&server, &c, 0).await;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["seq"], 1);
 
-    let (status, _) = send(
-        &server,
-        &a,
-        "0123456789abcdef0123456789abcdef",
-        "message",
-        b"bad",
-        now(),
-    )
-    .await;
+    let nonexistent = "0123456789abcdef0123456789abcdef";
+    let (status, _) = send(&server, &a, nonexistent, "message", b"bad", now()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(sync(&server, &c, 0).await.len(), 1, "404 must not enqueue");
+    let connection = rusqlite::Connection::open(server._temp.path().join("kite.db")).unwrap();
+    let rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM mailboxes WHERE owner_id = ?1",
+            [nonexistent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "404 must not enqueue");
     let (status, _) = send(&server, &a, &c.id, "message", b"future", now() + 300).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let (status, _) = send(&server, &a, &c.id, "message", b"past", now() - 300).await;
@@ -233,7 +240,7 @@ async fn long_poll_wakes_on_send_and_pairing_relays() {
     };
     let ((elapsed, entries), ()) = tokio::join!(poll, send);
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_millis(1500),
         "long poll took {elapsed:?}"
     );
     assert_eq!(entries.len(), 1);

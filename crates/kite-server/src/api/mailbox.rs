@@ -71,10 +71,18 @@ pub async fn enqueue(
         if exists.is_none() {
             return Err(ApiError::not_found());
         }
-        let seq: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM mailboxes WHERE owner_id = ?1",
-            [&to],
-            |row| row.get(0),
+        let seq: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(last_seq, 0) + 1 FROM owner_seq WHERE owner_id = ?1",
+                [&to],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(1);
+        transaction.execute(
+            "INSERT INTO owner_seq(owner_id,last_seq) VALUES(?1,?2)
+             ON CONFLICT(owner_id) DO UPDATE SET last_seq=excluded.last_seq",
+            params![to, seq],
         )?;
         transaction.execute(
             "INSERT INTO mailboxes(owner_id,seq,from_id,kind,payload,ts) VALUES(?1,?2,?3,?4,?5,?6)",
