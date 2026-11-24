@@ -25,6 +25,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/devices/{device_id}", get(api::directory::get))
         .route("/api/v1/bundles/opks", put(api::bundles::upload_opks))
         .route("/api/v1/bundles/{device_id}", get(api::bundles::get_bundle))
+        .route("/api/v1/send", post(api::mailbox::send))
+        .route("/api/v1/sync", get(api::mailbox::sync))
+        .route("/api/v1/ack", post(api::mailbox::ack))
+        .route("/api/v1/pair/request", post(api::pairing::request))
+        .route("/api/v1/pair/respond", post(api::pairing::respond))
         .with_state(state)
 }
 

@@ -10,6 +10,8 @@ use serde_json::json;
 pub mod auth;
 pub mod bundles;
 pub mod directory;
+pub mod mailbox;
+pub mod pairing;
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -44,7 +46,7 @@ impl ApiError {
         )
     }
 
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
             code,

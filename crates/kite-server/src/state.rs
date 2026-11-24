@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::db::Db;
 
@@ -9,6 +9,7 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub online: Arc<Mutex<HashMap<String, ()>>>,
     pub pending_challenges: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    pub notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     pub started: Arc<Instant>,
 }
 
@@ -18,6 +19,7 @@ impl AppState {
             db: Arc::new(db),
             online: Arc::new(Mutex::new(HashMap::new())),
             pending_challenges: Arc::new(Mutex::new(HashMap::new())),
+            notifications: Arc::new(Mutex::new(HashMap::new())),
             started: Arc::new(Instant::now()),
         }
     }
