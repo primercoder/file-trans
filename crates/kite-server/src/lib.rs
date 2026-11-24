@@ -10,6 +10,7 @@ use serde_json::json;
 use crate::{db::Db, state::AppState};
 
 pub mod api;
+pub mod config;
 pub mod db;
 pub mod state;
 pub mod tls;
@@ -18,6 +19,7 @@ pub mod tls;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/stats", get(api::stats::get))
         .route("/api/v1/register", post(api::auth::register))
         .route("/api/v1/auth/challenge", post(api::auth::challenge))
         .route("/api/v1/auth/verify", post(api::auth::verify))

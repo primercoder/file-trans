@@ -12,6 +12,7 @@ pub mod bundles;
 pub mod directory;
 pub mod mailbox;
 pub mod pairing;
+pub mod stats;
 
 #[derive(Debug)]
 pub struct ApiError {

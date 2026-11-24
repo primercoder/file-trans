@@ -26,6 +26,25 @@ pub async fn self_signed() -> Result<DevelopmentTls, Box<dyn Error>> {
     })
 }
 
+/// Loads an operator-supplied PEM certificate chain and private key.
+/// The certificate fingerprint has the same meaning as for self-signed certificates.
+pub async fn from_pem_files(cert: &Path, key: &Path) -> Result<DevelopmentTls, Box<dyn Error>> {
+    // Keep provider selection consistent with self-signed mode.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert_der = fs::read(cert)?;
+    let leaf = rustls_pemfile::certs(&mut cert_der.as_slice())
+        .next()
+        .transpose()?
+        .ok_or("KITE_TLS_CERT contains no PEM certificate")?;
+    let fingerprint = hex::encode(Sha256::digest(&leaf));
+    let config = RustlsConfig::from_pem_file(cert, key).await?;
+    Ok(DevelopmentTls {
+        config,
+        cert_der: leaf.to_vec(),
+        fingerprint,
+    })
+}
+
 pub fn write_fingerprint(db_path: &Path, fingerprint: &str) -> Result<(), Box<dyn Error>> {
     let directory = db_path
         .parent()
