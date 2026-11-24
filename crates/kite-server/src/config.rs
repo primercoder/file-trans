@@ -10,6 +10,9 @@ pub const DEFAULT_MAX_STORAGE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 pub struct Config {
     pub bind: SocketAddr,
+    /// Plaintext health-probe listener; deliberately separate from the authenticated API.
+    /// Container orchestrators use TCP/HTTP probes, for which TLS termination is awkward.
+    pub health_bind: SocketAddr,
     pub db_path: PathBuf,
     pub max_storage_bytes: u64,
     pub tls_paths: Option<(PathBuf, PathBuf)>,
@@ -20,6 +23,9 @@ impl Config {
     pub fn from_env() -> Result<Self, Box<dyn StdError>> {
         let bind = env::var("KITE_BIND")
             .unwrap_or_else(|_| "0.0.0.0:8443".to_owned())
+            .parse()?;
+        let health_bind = env::var("KITE_HEALTH_BIND")
+            .unwrap_or_else(|_| "0.0.0.0:8444".to_owned())
             .parse()?;
         let db_path =
             PathBuf::from(env::var("KITE_DB_PATH").unwrap_or_else(|_| "./kite.db".into()));
@@ -47,6 +53,7 @@ impl Config {
         };
         Ok(Self {
             bind,
+            health_bind,
             db_path,
             max_storage_bytes,
             tls_paths,

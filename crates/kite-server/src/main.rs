@@ -12,7 +12,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "Kite max storage bytes: {} (enforced in M2)",
         config.max_storage_bytes
     );
-    let app = kite_server::router_with_db(&config.db_path).await?;
+    let state = kite_server::state::AppState::new(kite_server::db::Db::open(&config.db_path)?);
+    let app = kite_server::router(state.clone());
+    let health_app = kite_server::health_router(state);
     let tls = match config.tls_paths {
         Some((cert, key)) => kite_server::tls::from_pem_files(&cert, &key).await?,
         None => kite_server::tls::self_signed().await?,
@@ -22,7 +24,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tls.fingerprint
     );
     kite_server::tls::write_fingerprint(&config.db_path, &tls.fingerprint)?;
-    tracing::info!(bind = %config.bind, "kite-server listening");
+    println!(
+        "Kite HTTPS API listening on {}; plaintext healthz probes on {}",
+        config.bind, config.health_bind
+    );
+    let health_listener = tokio::net::TcpListener::bind(config.health_bind).await?;
+    tokio::spawn(async move { axum::serve(health_listener, health_app).await });
     axum_server::bind_rustls(config.bind, tls.config)
         .serve(app.into_make_service())
         .await?;

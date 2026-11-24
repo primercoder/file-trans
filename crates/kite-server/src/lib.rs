@@ -35,6 +35,14 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Plaintext by design: container orchestrators use TCP/HTTP health probes.
+/// Only healthz is exposed here; authenticated API routes remain TLS-only.
+pub fn health_router(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(health))
+        .with_state(state)
+}
+
 pub async fn router_with_db(path: &Path) -> Result<Router, Box<dyn std::error::Error>> {
     Ok(router(AppState::new(Db::open(path)?)))
 }

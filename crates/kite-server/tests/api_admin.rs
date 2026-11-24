@@ -103,6 +103,7 @@ struct ChildServer {
     child: Child,
     client: reqwest::Client,
     base: String,
+    health_base: String,
 }
 
 impl Drop for ChildServer {
@@ -113,8 +114,14 @@ impl Drop for ChildServer {
 }
 
 async fn spawn_process(db: &std::path::Path, port: u16) -> ChildServer {
+    let health_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let child = Command::new(env!("CARGO_BIN_EXE_kite-server"))
         .env("KITE_BIND", format!("127.0.0.1:{port}"))
+        .env("KITE_HEALTH_BIND", format!("127.0.0.1:{health_port}"))
         .env("KITE_DB_PATH", db)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -122,12 +129,19 @@ async fn spawn_process(db: &std::path::Path, port: u16) -> ChildServer {
         .unwrap();
     let client = client();
     let base = format!("https://127.0.0.1:{port}");
+    let health_base = format!("http://127.0.0.1:{health_port}");
     for _ in 0..100 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
+        if client
+            .get(format!("{health_base}/healthz"))
+            .send()
+            .await
+            .is_ok()
+        {
             return ChildServer {
                 child,
                 client,
                 base,
+                health_base,
             };
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -158,6 +172,27 @@ async fn custom_db_path_and_healthz_uptime() {
     let health: Value = response.json().await.unwrap();
     assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
     assert!(health["uptime_s"].as_u64().unwrap() > 0);
+
+    let response = process
+        .client
+        .get(format!("{}/healthz", process.health_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let health: Value = response.json().await.unwrap();
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    assert!(health["uptime_s"].as_u64().unwrap() > 0);
+    assert_eq!(
+        process
+            .client
+            .get(format!("{}/api/v1/devices", process.health_base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test]
