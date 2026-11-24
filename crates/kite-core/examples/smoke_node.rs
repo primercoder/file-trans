@@ -21,7 +21,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let expected_message =
         env::var("SMOKE_MESSAGE").unwrap_or_else(|_| "three-endpoint smoke: hello from A".into());
     let mut engine = Engine::open(store, base_url, fingerprint)?;
-    engine.register(name, &format!("smoke-hardware-{name}")).await?;
+    engine
+        .register(name, &format!("smoke-hardware-{name}"))
+        .await?;
     println!("REGISTER_OK name={name} device_id={}", engine.device_id());
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -44,10 +46,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             engine.start_pairing(&peer_id).await?;
             println!("PAIR_REQUEST_SENT peer={peer_id}");
             loop {
-                if engine.poll_once().await?.iter().any(|event| matches!(
-                    event,
-                    InboxEvent::PairResponse { from, accepted: true } if *from == peer_id
-                )) {
+                if engine.poll_once().await?.iter().any(|event| {
+                    matches!(
+                        event,
+                        InboxEvent::PairResponse { from, accepted: true } if *from == peer_id
+                    )
+                }) {
                     break;
                 }
                 ensure_time_left(deadline, "pair response")?;
@@ -59,10 +63,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         "responder" => {
             loop {
-                if engine.poll_once().await?.iter().any(|event| matches!(
-                    event,
-                    InboxEvent::PairRequest { from, .. } if *from == peer_id
-                )) {
+                if engine.poll_once().await?.iter().any(|event| {
+                    matches!(
+                        event,
+                        InboxEvent::PairRequest { from, .. } if *from == peer_id
+                    )
+                }) {
                     break;
                 }
                 ensure_time_left(deadline, "pair request")?;

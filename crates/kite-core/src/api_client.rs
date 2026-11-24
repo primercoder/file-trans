@@ -107,7 +107,7 @@ impl ApiClient {
             .cloned()
             .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
         let tls = ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|error| EngineError::Configuration(error.to_string()))?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedCertificate {

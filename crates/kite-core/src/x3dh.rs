@@ -62,6 +62,19 @@ pub fn generate_spk(ik: &Identity) -> ([u8; 32], [u8; 32], [u8; 64]) {
 
 impl InitiatorKeys {
     pub fn run(bundle: &PreKeyBundle, ik: &Identity) -> Result<Self, CryptoError> {
+        let mut ek_bytes = [0_u8; 32];
+        OsRng
+            .try_fill_bytes(&mut ek_bytes)
+            .map_err(|_| CryptoError::InvalidKey)?;
+        Self::run_with_ephemeral(bundle, ik, ek_bytes)
+    }
+
+    /// Deterministic variant for protocol vectors and reproducible interoperability tests.
+    pub fn run_with_ephemeral(
+        bundle: &PreKeyBundle,
+        ik: &Identity,
+        ek_bytes: [u8; 32],
+    ) -> Result<Self, CryptoError> {
         let verifying_key =
             VerifyingKey::from_bytes(&bundle.ik_pub).map_err(|_| CryptoError::InvalidKey)?;
         verifying_key
@@ -71,10 +84,6 @@ impl InitiatorKeys {
         let ik_x = identity_to_x25519(ik);
         let peer_ik = ed25519_to_x25519(&bundle.ik_pub)?;
         let spk = PublicKey::from(bundle.spk);
-        let mut ek_bytes = [0_u8; 32];
-        OsRng
-            .try_fill_bytes(&mut ek_bytes)
-            .map_err(|_| CryptoError::InvalidKey)?;
         let ek = StaticSecret::from(ek_bytes);
         let ek_pub = PublicKey::from(&ek).to_bytes();
 

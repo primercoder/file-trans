@@ -123,6 +123,19 @@ fn restored_session_preserves_skipped_keys_and_continues_both_directions() {
     );
 }
 
+#[test]
+fn forged_new_ratchet_header_does_not_change_session() {
+    let (mut alice, mut bob) = sessions();
+    let first = alice.encrypt(b"first", b"ad").unwrap();
+    assert_eq!(bob.decrypt(&first, b"ad").unwrap(), b"first");
+    let legitimate = alice.encrypt(b"second", b"ad").unwrap();
+    let mut forged = clone_message(&legitimate);
+    forged.ratchet_pub = Some([99_u8; 32]);
+    forged.prev_chain_len = 1;
+    assert!(bob.decrypt(&forged, b"ad").is_err());
+    assert_eq!(bob.decrypt(&legitimate, b"ad").unwrap(), b"second");
+}
+
 fn clone_message(message: &RatchetMessage) -> RatchetMessage {
     RatchetMessage {
         ratchet_pub: message.ratchet_pub,

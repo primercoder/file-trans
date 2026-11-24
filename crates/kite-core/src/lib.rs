@@ -41,6 +41,10 @@ pub enum EngineError {
     },
     #[error("local store failed: {0}")]
     Store(#[from] rusqlite::Error),
+    #[error("local I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("hardware identifier hashing failed: {0}")]
+    HardwareHash(String),
     #[error("serialization failed: {0}")]
     Serialization(#[from] bincode::Error),
     #[error("JSON failed: {0}")]

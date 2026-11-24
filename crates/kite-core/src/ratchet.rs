@@ -8,12 +8,12 @@
 
 use std::collections::BTreeMap;
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::CryptoError;
@@ -32,8 +32,10 @@ pub struct RatchetMessage {
     pub ciphertext: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct Session {
     session_ad: Vec<u8>,
+    deterministic_kat: bool,
     root_key: [u8; 32],
     own_ratchet: StaticSecret,
     remote_ratchet_pub: Option<[u8; 32]>,
@@ -101,6 +103,7 @@ impl<'de> Deserialize<'de> for Session {
         }
         Ok(Session {
             session_ad: state.session_ad,
+            deterministic_kat: false,
             root_key: state.root_key,
             own_ratchet: StaticSecret::from(state.own_ratchet),
             remote_ratchet_pub: state.remote_ratchet_pub,
@@ -120,11 +123,40 @@ impl Session {
         session_ad: Vec<u8>,
         remote_ratchet_pub: [u8; 32],
     ) -> Result<Session, CryptoError> {
-        let own_ratchet = random_ratchet_key()?;
+        Self::init_as_initiator_with_ratchet(
+            sk,
+            session_ad,
+            remote_ratchet_pub,
+            random_ratchet_key()?.to_bytes(),
+        )
+    }
+
+    /// Deterministic initializer for pinned cross-change protocol vectors.
+    pub fn init_as_initiator_with_ratchet(
+        sk: [u8; 32],
+        session_ad: Vec<u8>,
+        remote_ratchet_pub: [u8; 32],
+        own_ratchet: [u8; 32],
+    ) -> Result<Session, CryptoError> {
+        Self::init_with_ratchet(
+            sk,
+            session_ad,
+            remote_ratchet_pub,
+            StaticSecret::from(own_ratchet),
+        )
+    }
+
+    fn init_with_ratchet(
+        sk: [u8; 32],
+        session_ad: Vec<u8>,
+        remote_ratchet_pub: [u8; 32],
+        own_ratchet: StaticSecret,
+    ) -> Result<Session, CryptoError> {
         let (root_key, sending_chain) =
             derive_root(sk, &own_ratchet, &PublicKey::from(remote_ratchet_pub))?;
         Ok(Session {
             session_ad,
+            deterministic_kat: false,
             root_key,
             own_ratchet,
             remote_ratchet_pub: Some(remote_ratchet_pub),
@@ -149,6 +181,7 @@ impl Session {
         }
         Ok(Session {
             session_ad,
+            deterministic_kat: false,
             root_key: sk,
             own_ratchet,
             remote_ratchet_pub: None,
@@ -162,9 +195,45 @@ impl Session {
     }
 
     pub fn encrypt(&mut self, plaintext: &[u8], ad: &[u8]) -> Result<RatchetMessage, CryptoError> {
+        let mut nonce_bytes = [0_u8; 12];
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .map_err(|_| CryptoError::RandomnessUnavailable)?;
+        self.encrypt_inner(plaintext, ad, nonce_bytes, false)
+    }
+
+    /// Deterministic nonce and DH advancement for protocol known-answer tests.
+    pub fn enable_deterministic_kat(&mut self) {
+        self.deterministic_kat = true;
+    }
+
+    pub fn encrypt_with_nonce(
+        &mut self,
+        plaintext: &[u8],
+        ad: &[u8],
+        nonce_bytes: [u8; 12],
+    ) -> Result<RatchetMessage, CryptoError> {
+        self.encrypt_inner(plaintext, ad, nonce_bytes, true)
+    }
+
+    fn encrypt_inner(
+        &mut self,
+        plaintext: &[u8],
+        ad: &[u8],
+        nonce_bytes: [u8; 12],
+        deterministic: bool,
+    ) -> Result<RatchetMessage, CryptoError> {
         if self.sending_chain.is_none() {
             let remote = self.remote_ratchet_pub.ok_or(CryptoError::InvalidMessage)?;
-            self.own_ratchet = random_ratchet_key()?;
+            if self.receiving_chain.is_some() {
+                self.own_ratchet = if deterministic {
+                    let mut seed = self.own_ratchet.to_bytes().to_vec();
+                    seed.extend_from_slice(&nonce_bytes);
+                    StaticSecret::from(<[u8; 32]>::from(Sha256::digest(seed)))
+                } else {
+                    random_ratchet_key()?
+                };
+            }
             let (root, chain) =
                 derive_root(self.root_key, &self.own_ratchet, &PublicKey::from(remote))?;
             self.root_key = root;
@@ -181,9 +250,7 @@ impl Session {
             .checked_add(1)
             .ok_or(CryptoError::InvalidKey)?;
 
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let mut nonce_bytes = [0_u8; 12];
-        nonce_bytes.copy_from_slice(&nonce);
+        let nonce = Nonce::from(nonce_bytes);
         let ratchet_pub = PublicKey::from(&self.own_ratchet).to_bytes();
         let aad = authenticated_data(
             &self.session_ad,
@@ -220,16 +287,19 @@ impl Session {
             return Ok(plaintext);
         }
 
-        if self.remote_ratchet_pub != Some(ratchet_pub) {
-            if self.receiving_chain.is_some() {
-                self.skip_message_keys(msg.prev_chain_len)?;
+        let mut staged = self.clone();
+        if staged.remote_ratchet_pub != Some(ratchet_pub) {
+            if staged.receiving_chain.is_some() {
+                staged.skip_message_keys(msg.prev_chain_len)?;
             }
-            self.dh_ratchet(ratchet_pub)?;
+            staged.dh_ratchet(ratchet_pub)?;
         }
-        self.skip_message_keys(msg.header_seq)?;
-        let chain = self.receiving_chain.ok_or(CryptoError::InvalidMessage)?;
+        staged.skip_message_keys(msg.header_seq)?;
+        let chain = staged.receiving_chain.ok_or(CryptoError::InvalidMessage)?;
         let (next_chain, message_key) = derive_message_key(chain)?;
-        let plaintext = decrypt_with_key(message_key, &self.session_ad, msg, ad)?;
+        let plaintext = decrypt_with_key(message_key, &staged.session_ad, msg, ad)?;
+        // Commit the clone only after AEAD succeeds; forged headers leave self intact.
+        *self = staged;
         self.receiving_chain = Some(next_chain);
         self.recv_seq = self
             .recv_seq
@@ -246,7 +316,13 @@ impl Session {
         self.recv_seq = 0;
         self.prev_chain_len = self.send_seq;
         self.remote_ratchet_pub = Some(remote);
-        self.own_ratchet = random_ratchet_key()?;
+        self.own_ratchet = if self.deterministic_kat {
+            let mut seed = self.own_ratchet.to_bytes().to_vec();
+            seed.extend_from_slice(&remote);
+            StaticSecret::from(<[u8; 32]>::from(Sha256::digest(seed)))
+        } else {
+            random_ratchet_key()?
+        };
         let (root, sending_chain) = derive_root(self.root_key, &self.own_ratchet, &remote_key)?;
         self.root_key = root;
         self.sending_chain = Some(sending_chain);

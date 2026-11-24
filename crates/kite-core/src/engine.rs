@@ -9,6 +9,10 @@
 
 use std::path::Path;
 
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher as _, SaltString, rand_core::OsRng as HashOsRng},
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use rand::{TryRngCore as _, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -18,7 +22,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::{
     ApiClient, BundleDto, CryptoError, DeviceInfo, EngineError, Identity, IdentityState,
     InitiatorKeys, PreKeyBundle, RatchetMessage, ResponderKeys, Result, Session, Store,
-    generate_spk,
+    generate_spk, store::EntryOutcome,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -111,10 +115,25 @@ impl Engine {
         &self.device_id
     }
 
-    pub async fn register(&mut self, name: &str, hw_hash: &str) -> Result<()> {
+    pub async fn register(&mut self, name: &str, raw_hw_id: &str) -> Result<()> {
         let device_id = self.device_id().to_owned();
+        let salt = SaltString::generate(&mut HashOsRng);
+        let hw_hash = Argon2::default()
+            .hash_password(raw_hw_id.as_bytes(), &salt)
+            .map_err(|error| EngineError::HardwareHash(error.to_string()))?
+            .to_string();
         let (spk_private, spk, spk_sig) = generate_spk(&self.identity);
-        let opks: Vec<(u32, [u8; 32])> = (0..10)
+        let mut old_opks = self
+            .store
+            .identity()?
+            .map(|state| state.opks)
+            .unwrap_or_default();
+        let first_opk_id = old_opks
+            .iter()
+            .map(|(id, _)| *id)
+            .max()
+            .map_or(0, |id| id.saturating_add(1));
+        let opks: Vec<(u32, [u8; 32])> = (first_opk_id..first_opk_id + 10)
             .map(|id| {
                 let mut bytes = [0_u8; 32];
                 OsRng
@@ -123,15 +142,6 @@ impl Engine {
                 Ok((id, bytes))
             })
             .collect::<std::result::Result<_, CryptoError>>()?;
-        self.spk_private = spk_private;
-        self.name = Some(name.to_owned());
-        self.store.save_identity(&IdentityState {
-            private_pem: self.identity.private_pem(),
-            token: self.token.clone(),
-            spk_private,
-            name: self.name.clone(),
-            opks: opks.clone(),
-        })?;
         let ik_pub = self.identity.ed25519_public_key();
         let sig = self
             .identity
@@ -149,9 +159,23 @@ impl Engine {
             }).collect::<Vec<_>>(),
             "sig": hex::encode(sig),
         });
+        // Persist only after server success: a failed registration must leave
+        // the previous identity/token/prekeys usable. Re-registering replaces
+        // the SPK but deliberately leaves all paired sessions intact.
+        // The server keeps only this latest SPK, so an in-flight handshake that
+        // fetched the previous SPK can fail; callers may retry with a new bundle.
         let token = self.api.register(body).await?;
+        old_opks.extend(opks);
+        self.spk_private = spk_private;
+        self.name = Some(name.to_owned());
         self.token = Some(token);
-        self.persist_identity()?;
+        self.store.save_identity(&IdentityState {
+            private_pem: self.identity.private_pem(),
+            token: self.token.clone(),
+            spk_private,
+            name: self.name.clone(),
+            opks: old_opks,
+        })?;
         Ok(())
     }
 
@@ -184,12 +208,22 @@ impl Engine {
             used_opk_id: x3dh.used_opk_id,
             body: encode(&body)?,
         };
-        self.api
-            .pair_request(&token, peer, B64.encode(serde_json::to_vec(&envelope)?))
-            .await?;
+        // Persist before sending so a timeout leaves recoverable pending state.
+        // A definite send failure rolls it back; ambiguous timeout reconciliation
+        // is post-M1 work (the server may still deliver the request).
         self.store
             .save_session(peer, &bincode::serialize(&session)?, "pending_outgoing")?;
         self.store.save_pending(peer, &name, challenge)?;
+        if let Err(error) = self
+            .api
+            .pair_request(&token, peer, B64.encode(serde_json::to_vec(&envelope)?))
+            .await
+        {
+            if !matches!(&error, EngineError::Http(error) if error.is_timeout()) {
+                self.store.rollback_pairing(peer, "pending_outgoing")?;
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -217,14 +251,21 @@ impl Engine {
             accepted: true,
             body: encode(&body)?,
         };
-        self.api
+        if let Err(error) = self
+            .api
             .pair_response(
                 &self.token()?,
                 peer,
                 true,
                 B64.encode(serde_json::to_vec(&response)?),
             )
-            .await?;
+            .await
+        {
+            if !matches!(&error, EngineError::Http(error) if error.is_timeout()) {
+                self.store.rollback_pairing(peer, "pending_accept")?;
+            }
+            return Err(error);
+        }
         self.store
             .save_session(peer, &bincode::serialize(&session)?, "paired")?;
         self.store.remove_pending(peer)?;
@@ -253,87 +294,116 @@ impl Engine {
 
     pub async fn poll_once(&mut self) -> Result<Vec<InboxEvent>> {
         let token = self.token()?;
-        let entries = self.api.sync(&token, self.store.cursor()?).await?;
+        let cursor = self.store.cursor()?;
+        if cursor > 0 {
+            // Retry cleanup for the previously committed but possibly un-ACKed prefix.
+            let _ = self.api.ack(&token, cursor).await;
+        }
+        let entries = self.api.sync(&token, cursor).await?;
         let mut events = Vec::new();
         let mut latest = None;
         for entry in entries {
-            match entry.kind.as_str() {
-                "pair_req" => events.push(self.receive_pair_request(&entry.from, &entry.payload)?),
-                "pair_resp" => {
-                    let response: PairResponseWire =
-                        serde_json::from_slice(&B64.decode(&entry.payload)?)?;
-                    if response.version != 1 {
-                        return Err(EngineError::Protocol("unsupported pair response".into()));
-                    }
-                    let Some((state, status)) = self.store.session(&entry.from)? else {
-                        return Err(EngineError::Protocol("response for unknown peer".into()));
-                    };
-                    if status != "pending_outgoing" {
-                        return Err(EngineError::Protocol("unsolicited pair response".into()));
-                    }
-                    let Some((_, challenge)) = self.store.pending(&entry.from)? else {
-                        return Err(EngineError::Protocol("unsolicited pair response".into()));
-                    };
-                    let body: RatchetMessage = decode(&response.body)?;
-                    let mut session: Session = bincode::deserialize(&state)?;
-                    let plaintext = session.decrypt(&body, &[])?;
-                    let body: PairResponseBody = bincode::deserialize(&plaintext)?;
-                    if challenge != body.challenge {
-                        return Err(EngineError::Protocol(
-                            "pair response challenge mismatch".into(),
-                        ));
-                    }
-                    if response.accepted {
-                        self.store.save_session(
-                            &entry.from,
-                            &bincode::serialize(&session)?,
-                            "paired",
-                        )?;
-                    } else {
-                        self.store.remove_session(&entry.from)?;
-                    }
-                    self.store.remove_pending(&entry.from)?;
-                    events.push(InboxEvent::PairResponse {
-                        from: entry.from,
-                        accepted: response.accepted,
-                    });
-                }
-                "msg" => {
-                    let (state, status) = self.store.session(&entry.from)?.ok_or_else(|| {
-                        EngineError::Protocol("message from unpaired peer".into())
-                    })?;
-                    if status != "paired" {
-                        return Err(EngineError::Protocol(
-                            "message before pairing accepted".into(),
-                        ));
-                    }
-                    let mut session: Session = bincode::deserialize(&state)?;
-                    let ad = session_ad(&session);
-                    let message: RatchetMessage = decode(&entry.payload)?;
-                    let plaintext = session.decrypt(&message, &ad)?;
-                    self.store.save_session(
-                        &entry.from,
-                        &bincode::serialize(&session)?,
-                        "paired",
-                    )?;
-                    events.push(InboxEvent::Message {
-                        from: entry.from,
-                        text: String::from_utf8(plaintext)?,
-                    });
-                }
-                _ => {}
+            // Poison, replay, stale timestamps and consumed ratchet keys are all
+            // durable failures, not reasons to wedge every subsequent entry.
+            let outcome = match self.process_entry(&entry) {
+                Ok(outcome) => outcome,
+                Err(error @ (EngineError::Store(_) | EngineError::Io(_))) => return Err(error),
+                Err(_) => EntryOutcome::failed(),
+            };
+            if let Some(event) = self.store.commit_entry(entry.seq, outcome)? {
+                events.push(event);
             }
             latest = Some(entry.seq);
         }
         if let Some(seq) = latest {
-            // Never let the server discard an entry before its cursor is durable.
-            self.store.set_cursor(seq)?;
-            self.api.ack(&token, seq).await?;
+            // Every entry through seq has committed locally. ACK is best-effort:
+            // an ACK failure must not discard events or committed ratchet state.
+            let _ = self.api.ack(&token, seq).await;
         }
         Ok(events)
     }
 
-    fn receive_pair_request(&mut self, from: &str, payload: &str) -> Result<InboxEvent> {
+    fn process_entry(&mut self, entry: &crate::api_client::MailEntry) -> Result<EntryOutcome> {
+        match entry.kind.as_str() {
+            "pair_req" => self.receive_pair_request(&entry.from, &entry.payload),
+            "pair_resp" => self.receive_pair_response(&entry.from, &entry.payload),
+            "msg" => self.receive_message(&entry.from, &entry.payload),
+            _ => Ok(EntryOutcome::failed()),
+        }
+    }
+
+    fn receive_pair_response(&self, from: &str, payload: &str) -> Result<EntryOutcome> {
+        let response: PairResponseWire = serde_json::from_slice(&B64.decode(payload)?)?;
+        if response.version != 1 {
+            return Err(EngineError::Protocol("unsupported pair response".into()));
+        }
+        let Some((state, status)) = self.store.session(from)? else {
+            return Err(EngineError::Protocol("response for unknown peer".into()));
+        };
+        if status != "pending_outgoing" {
+            return Err(EngineError::Protocol("unsolicited pair response".into()));
+        }
+        let Some((_, challenge)) = self.store.pending(from)? else {
+            return Err(EngineError::Protocol("unsolicited pair response".into()));
+        };
+        let body: RatchetMessage = decode(&response.body)?;
+        let mut session: Session = bincode::deserialize(&state)?;
+        let plaintext = session.decrypt(&body, &[])?;
+        let body: PairResponseBody = bincode::deserialize(&plaintext)?;
+        check_timestamp(body.ts)?;
+        if challenge != body.challenge {
+            return Err(EngineError::Protocol(
+                "pair response challenge mismatch".into(),
+            ));
+        }
+        Ok(EntryOutcome {
+            event: Some(InboxEvent::PairResponse {
+                from: from.to_owned(),
+                accepted: response.accepted,
+            }),
+            session: response.accepted.then(|| {
+                (
+                    from.to_owned(),
+                    bincode::serialize(&session).unwrap_or_default(),
+                    "paired".into(),
+                )
+            }),
+            remove_session: (!response.accepted).then(|| from.to_owned()),
+            remove_pending: Some(from.to_owned()),
+            ..EntryOutcome::default()
+        })
+    }
+
+    fn receive_message(&self, from: &str, payload: &str) -> Result<EntryOutcome> {
+        let (state, status) = self
+            .store
+            .session(from)?
+            .ok_or_else(|| EngineError::Protocol("message from unpaired peer".into()))?;
+        if status != "paired" {
+            return Err(EngineError::Protocol(
+                "message before pairing accepted".into(),
+            ));
+        }
+        let mut session: Session = bincode::deserialize(&state)?;
+        let ad = session_ad(&session);
+        let message: RatchetMessage = decode(payload)?;
+        let plaintext = session.decrypt(&message, &ad)?;
+        let text = String::from_utf8(plaintext)?;
+        Ok(EntryOutcome {
+            event: Some(InboxEvent::Message {
+                from: from.to_owned(),
+                text,
+            }),
+            session: Some((
+                from.to_owned(),
+                bincode::serialize(&session)?,
+                "paired".into(),
+            )),
+            ..EntryOutcome::default()
+        })
+    }
+
+    fn receive_pair_request(&self, from: &str, payload: &str) -> Result<EntryOutcome> {
         let envelope: PairRequestWire = serde_json::from_slice(&B64.decode(payload)?)?;
         if envelope.version != 1 {
             return Err(EngineError::Protocol("unsupported pair request".into()));
@@ -346,8 +416,32 @@ impl Engine {
                 "pair request identity does not match sender".into(),
             ));
         }
+        if self.store.session(from)?.is_some()
+            || self
+                .store
+                .handshake_seen(from, &Sha256::digest(ek_pub).into())?
+        {
+            return Err(EngineError::Protocol(
+                "replayed or already-paired request".into(),
+            ));
+        }
         let opk = match envelope.used_opk_id {
-            Some(id) => self.store.take_opk(id)?,
+            Some(id) => {
+                let identity = self
+                    .store
+                    .identity()?
+                    .ok_or_else(|| EngineError::Protocol("identity is not initialized".into()))?;
+                Some(
+                    identity
+                        .opks
+                        .iter()
+                        .find(|(key_id, _)| *key_id == id)
+                        .map(|(_, secret)| *secret)
+                        .ok_or_else(|| {
+                            EngineError::Protocol("one-time prekey is no longer available".into())
+                        })?,
+                )
+            }
             None => None,
         };
         let responder = ResponderKeys::run(
@@ -357,8 +451,6 @@ impl Engine {
             &ik_pub,
             &ek_pub,
         )?;
-        // The initiator's first DH ratchet step targets the signed prekey, so
-        // the responder must initialize its session with that same key pair.
         let private = self.spk_private;
         let ratchet = StaticSecret::from(private);
         let public = PublicKey::from(&ratchet).to_bytes();
@@ -368,12 +460,22 @@ impl Engine {
         let encrypted: RatchetMessage = decode(&envelope.body)?;
         let plaintext = session.decrypt(&encrypted, &[])?;
         let body: PairRequestBody = bincode::deserialize(&plaintext)?;
-        self.store
-            .save_session(from, &bincode::serialize(&session)?, "pending_accept")?;
-        self.store.save_pending(from, &body.name, body.challenge)?;
-        Ok(InboxEvent::PairRequest {
-            from: from.to_owned(),
-            name: body.name,
+        check_timestamp(body.ts)?;
+        // OPK and replay nonce become durable only after successful authentication.
+        Ok(EntryOutcome {
+            event: Some(InboxEvent::PairRequest {
+                from: from.to_owned(),
+                name: body.name.clone(),
+            }),
+            session: Some((
+                from.to_owned(),
+                bincode::serialize(&session)?,
+                "pending_accept".into(),
+            )),
+            pending: Some((from.to_owned(), body.name, body.challenge)),
+            consume_opk: envelope.used_opk_id,
+            handshake_nonce: Some((from.to_owned(), Sha256::digest(ek_pub).into())),
+            ..EntryOutcome::default()
         })
     }
 
@@ -381,21 +483,6 @@ impl Engine {
         self.token
             .clone()
             .ok_or_else(|| EngineError::Protocol("device is not registered".into()))
-    }
-
-    fn persist_identity(&self) -> Result<()> {
-        let old = self
-            .store
-            .identity()?
-            .ok_or_else(|| EngineError::Protocol("identity is not initialized".into()))?;
-        self.store.save_identity(&IdentityState {
-            private_pem: self.identity.private_pem(),
-            token: self.token.clone(),
-            spk_private: self.spk_private,
-            name: self.name.clone(),
-            opks: old.opks,
-        })?;
-        Ok(())
     }
 }
 
@@ -441,6 +528,15 @@ fn random_bytes() -> Result<[u8; 32]> {
         .try_fill_bytes(&mut bytes)
         .map_err(|_| CryptoError::RandomnessUnavailable)?;
     Ok(bytes)
+}
+
+fn check_timestamp(ts: i64) -> Result<()> {
+    if (unix_time()? - ts).abs() > 120 {
+        return Err(EngineError::Protocol(
+            "pairing envelope timestamp outside 120s window".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn unix_time() -> Result<i64> {
