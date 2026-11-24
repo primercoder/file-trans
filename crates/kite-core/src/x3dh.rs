@@ -24,6 +24,10 @@ pub enum CryptoError {
     ZeroDh,
     InvalidKey,
     HkdfLength,
+    DecryptFailed,
+    SkippedLimit,
+    InvalidMessage,
+    RandomnessUnavailable,
 }
 
 pub struct PreKeyBundle {
