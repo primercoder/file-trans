@@ -47,7 +47,7 @@ while (( SECONDS < health_deadline )); do
         break
     fi
     remaining=$((health_deadline - SECONDS))
-    if (( remaining > 0 )); then
+    if (( remaining >= 1 )); then
         sleep 1
     fi
 done
