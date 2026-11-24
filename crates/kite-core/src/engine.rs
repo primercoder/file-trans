@@ -1,9 +1,11 @@
 //! High-level client flow: registration, asynchronous pairing, and messaging.
 //!
-//! Pairing payloads are base64(bincode(`PairEnvelope`)); the responder trusts the
-//! enclosed identity key only after X3DH verifies the server-provided SPK at the
-//! initiator. `ratchet_pub` is the responder SPK used to initialize the ratchet.
-//! Messages are base64(bincode(`RatchetMessage`)); `Session` adds the X3DH AD.
+//! Pair requests are base64(JSON `{header, body}`): the plaintext header contains
+//! only public X3DH fields (`ik_pub`, `ek_pub`, `used_opk_id`), while `body` is
+//! base64(bincode(`RatchetMessage`)) encrypting `{name, challenge, ts}`.
+//! Pair responses similarly expose only `accepted`; their encrypted body contains
+//! `{challenge, ts}`. Messages are base64(bincode(`RatchetMessage`)). All private
+//! pairing content and messages are therefore ciphertext on the server.
 
 use std::path::Path;
 
@@ -27,21 +29,32 @@ pub enum InboxEvent {
 }
 
 #[derive(Serialize, Deserialize)]
-struct PairEnvelope {
+struct PairRequestWire {
     version: u8,
-    name: String,
-    ik_pub: [u8; 32],
-    ek_pub: [u8; 32],
+    ik_pub: String,
+    ek_pub: String,
     used_opk_id: Option<u32>,
-    challenge: [u8; 32],
-    ratchet_pub: [u8; 32],
+    body: String,
 }
 
 #[derive(Serialize, Deserialize)]
-struct PairResponseEnvelope {
+struct PairRequestBody {
+    name: String,
+    challenge: [u8; 32],
+    ts: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PairResponseWire {
     version: u8,
     accepted: bool,
+    body: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PairResponseBody {
     challenge: [u8; 32],
+    ts: i64,
 }
 
 pub struct Engine {
@@ -152,26 +165,31 @@ impl Engine {
         let bundle = decode_bundle(dto)?;
         let x3dh = InitiatorKeys::run(&bundle, &self.identity)?;
         let ad = associated_data(&self.identity.ed25519_public_key(), &bundle.ik_pub);
-        let session = Session::init_as_initiator(x3dh.shared_secret, ad, bundle.spk)?;
+        let mut session = Session::init_as_initiator(x3dh.shared_secret, ad, bundle.spk)?;
         let challenge = random_bytes()?;
-        let envelope = PairEnvelope {
-            version: 1,
-            name: self
-                .name
-                .clone()
-                .unwrap_or_else(|| self.device_id().to_owned()),
-            ik_pub: self.identity.ed25519_public_key(),
-            ek_pub: x3dh.ek_pub,
-            used_opk_id: x3dh.used_opk_id,
+        let name = self
+            .name
+            .clone()
+            .unwrap_or_else(|| self.device_id().to_owned());
+        let body = PairRequestBody {
+            name: name.clone(),
             challenge,
-            ratchet_pub: bundle.spk,
+            ts: unix_time()?,
+        };
+        let body = session.encrypt(&bincode::serialize(&body)?, &[])?;
+        let envelope = PairRequestWire {
+            version: 1,
+            ik_pub: B64.encode(self.identity.ed25519_public_key()),
+            ek_pub: B64.encode(x3dh.ek_pub),
+            used_opk_id: x3dh.used_opk_id,
+            body: encode(&body)?,
         };
         self.api
-            .pair_request(&token, peer, encode(&envelope)?)
+            .pair_request(&token, peer, B64.encode(serde_json::to_vec(&envelope)?))
             .await?;
         self.store
-            .save_session(peer, &bincode::serialize(&session)?, "paired")?;
-        self.store.save_pending(peer, &envelope.name, challenge)?;
+            .save_session(peer, &bincode::serialize(&session)?, "pending_outgoing")?;
+        self.store.save_pending(peer, &name, challenge)?;
         Ok(())
     }
 
@@ -188,15 +206,27 @@ impl Engine {
             .store
             .pending(peer)?
             .ok_or_else(|| EngineError::Protocol("pairing request is not pending".into()))?;
-        let response = PairResponseEnvelope {
+        let response_body = PairResponseBody {
+            challenge,
+            ts: unix_time()?,
+        };
+        let mut session: Session = bincode::deserialize(&state)?;
+        let body = session.encrypt(&bincode::serialize(&response_body)?, &[])?;
+        let response = PairResponseWire {
             version: 1,
             accepted: true,
-            challenge,
+            body: encode(&body)?,
         };
         self.api
-            .pair_response(&self.token()?, peer, true, encode(&response)?)
+            .pair_response(
+                &self.token()?,
+                peer,
+                true,
+                B64.encode(serde_json::to_vec(&response)?),
+            )
             .await?;
-        self.store.save_session(peer, &state, "paired")?;
+        self.store
+            .save_session(peer, &bincode::serialize(&session)?, "paired")?;
         self.store.remove_pending(peer)?;
         Ok(())
     }
@@ -230,25 +260,39 @@ impl Engine {
             match entry.kind.as_str() {
                 "pair_req" => events.push(self.receive_pair_request(&entry.from, &entry.payload)?),
                 "pair_resp" => {
-                    let response: PairResponseEnvelope = decode(&entry.payload)?;
+                    let response: PairResponseWire =
+                        serde_json::from_slice(&B64.decode(&entry.payload)?)?;
                     if response.version != 1 {
                         return Err(EngineError::Protocol("unsupported pair response".into()));
                     }
-                    if response.accepted {
-                        let Some((state, status)) = self.store.session(&entry.from)? else {
-                            return Err(EngineError::Protocol("response for unknown peer".into()));
-                        };
-                        let Some((_, challenge)) = self.store.pending(&entry.from)? else {
-                            return Err(EngineError::Protocol("unsolicited pair response".into()));
-                        };
-                        if status != "paired" || challenge != response.challenge {
-                            return Err(EngineError::Protocol(
-                                "pair response challenge mismatch".into(),
-                            ));
-                        }
-                        self.store.save_session(&entry.from, &state, "paired")?;
-                        self.store.remove_pending(&entry.from)?;
+                    let Some((state, status)) = self.store.session(&entry.from)? else {
+                        return Err(EngineError::Protocol("response for unknown peer".into()));
+                    };
+                    if status != "pending_outgoing" {
+                        return Err(EngineError::Protocol("unsolicited pair response".into()));
                     }
+                    let Some((_, challenge)) = self.store.pending(&entry.from)? else {
+                        return Err(EngineError::Protocol("unsolicited pair response".into()));
+                    };
+                    let body: RatchetMessage = decode(&response.body)?;
+                    let mut session: Session = bincode::deserialize(&state)?;
+                    let plaintext = session.decrypt(&body, &[])?;
+                    let body: PairResponseBody = bincode::deserialize(&plaintext)?;
+                    if challenge != body.challenge {
+                        return Err(EngineError::Protocol(
+                            "pair response challenge mismatch".into(),
+                        ));
+                    }
+                    if response.accepted {
+                        self.store.save_session(
+                            &entry.from,
+                            &bincode::serialize(&session)?,
+                            "paired",
+                        )?;
+                    } else {
+                        self.store.remove_session(&entry.from)?;
+                    }
+                    self.store.remove_pending(&entry.from)?;
                     events.push(InboxEvent::PairResponse {
                         from: entry.from,
                         accepted: response.accepted,
@@ -282,18 +326,21 @@ impl Engine {
             latest = Some(entry.seq);
         }
         if let Some(seq) = latest {
-            self.api.ack(&token, seq).await?;
+            // Never let the server discard an entry before its cursor is durable.
             self.store.set_cursor(seq)?;
+            self.api.ack(&token, seq).await?;
         }
         Ok(events)
     }
 
     fn receive_pair_request(&mut self, from: &str, payload: &str) -> Result<InboxEvent> {
-        let envelope: PairEnvelope = decode(payload)?;
+        let envelope: PairRequestWire = serde_json::from_slice(&B64.decode(payload)?)?;
         if envelope.version != 1 {
             return Err(EngineError::Protocol("unsupported pair request".into()));
         }
-        let sender_id = hex::encode(&Sha256::digest(envelope.ik_pub)[..16]);
+        let ik_pub = decode_array(&envelope.ik_pub)?;
+        let ek_pub = decode_array(&envelope.ek_pub)?;
+        let sender_id = hex::encode(&Sha256::digest(ik_pub)[..16]);
         if sender_id != from {
             return Err(EngineError::Protocol(
                 "pair request identity does not match sender".into(),
@@ -307,23 +354,26 @@ impl Engine {
             &self.identity,
             &self.spk_private,
             opk.as_ref(),
-            &envelope.ik_pub,
-            &envelope.ek_pub,
+            &ik_pub,
+            &ek_pub,
         )?;
         // The initiator's first DH ratchet step targets the signed prekey, so
         // the responder must initialize its session with that same key pair.
         let private = self.spk_private;
         let ratchet = StaticSecret::from(private);
         let public = PublicKey::from(&ratchet).to_bytes();
-        let ad = associated_data(&envelope.ik_pub, &self.identity.ed25519_public_key());
-        let session = Session::init_as_responder(responder.shared_secret, ad, (private, public))?;
+        let ad = associated_data(&ik_pub, &self.identity.ed25519_public_key());
+        let mut session =
+            Session::init_as_responder(responder.shared_secret, ad, (private, public))?;
+        let encrypted: RatchetMessage = decode(&envelope.body)?;
+        let plaintext = session.decrypt(&encrypted, &[])?;
+        let body: PairRequestBody = bincode::deserialize(&plaintext)?;
         self.store
             .save_session(from, &bincode::serialize(&session)?, "pending_accept")?;
-        self.store
-            .save_pending(from, &envelope.name, envelope.challenge)?;
+        self.store.save_pending(from, &body.name, body.challenge)?;
         Ok(InboxEvent::PairRequest {
             from: from.to_owned(),
-            name: envelope.name,
+            name: body.name,
         })
     }
 
@@ -391,4 +441,11 @@ fn random_bytes() -> Result<[u8; 32]> {
         .try_fill_bytes(&mut bytes)
         .map_err(|_| CryptoError::RandomnessUnavailable)?;
     Ok(bytes)
+}
+
+fn unix_time() -> Result<i64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| EngineError::Configuration(error.to_string()))?
+        .as_secs() as i64)
 }

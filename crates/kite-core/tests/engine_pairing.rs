@@ -6,7 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use kite_core::{Engine, InboxEvent};
+use rusqlite::Connection;
+use serde_json::Value;
 use tempfile::TempDir;
 
 struct TestServer {
@@ -23,20 +26,8 @@ impl TestServer {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let db_path = temp.path().join("server.db");
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let build = Command::new(env!("CARGO"))
-            .args(["build", "-p", "kite-server"])
-            .current_dir(&workspace)
-            .stdout(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(build.success());
-        let profile = if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        };
-        let server_binary = workspace.join("target").join(profile).join("kite-server");
+        let server_binary = std::env::var("CARGO_BIN_EXE_kite-server")
+            .expect("run with the workspace test harness providing kite-server's binary path");
         let child = Command::new(server_binary)
             .env("KITE_BIND", address.to_string())
             .env("KITE_DB_PATH", &db_path)
@@ -100,6 +91,20 @@ async fn pairing_messaging_offline_delivery_and_restart() {
     assert!(devices.iter().any(|device| device.device_id == alice_id));
 
     alice.start_pairing(&bob_id).await.unwrap();
+    assert!(alice.send_message(&bob_id, "too early").await.is_err());
+    let connection = Connection::open(server._temp.path().join("server.db")).unwrap();
+    let raw_payload: Vec<u8> = connection
+        .query_row(
+            "SELECT payload FROM mailboxes WHERE kind='pair_req'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!raw_payload.windows(5).any(|window| window == b"Alice"));
+    let wire: Value = serde_json::from_slice(&raw_payload).unwrap();
+    let encrypted_body = B64.decode(wire["body"].as_str().unwrap()).unwrap();
+    assert!(!encrypted_body.windows(5).any(|window| window == b"Alice"));
+    drop(connection);
     let events = bob.poll_once().await.unwrap();
     assert!(matches!(
         events.as_slice(),

@@ -27,7 +27,7 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS sessions(
                  device_id TEXT PRIMARY KEY, state BLOB NOT NULL,
-                 status TEXT NOT NULL CHECK(status IN ('pending_accept','paired'))
+                 status TEXT NOT NULL CHECK(status IN ('pending_accept','pending_outgoing','paired'))
              );
              CREATE TABLE IF NOT EXISTS pending_pairing(
                  device_id TEXT PRIMARY KEY, name TEXT NOT NULL, challenge BLOB NOT NULL
@@ -102,6 +102,12 @@ impl Store {
              ON CONFLICT(device_id) DO UPDATE SET state=excluded.state,status=excluded.status",
             params![peer, state, status],
         )?;
+        Ok(())
+    }
+
+    pub fn remove_session(&self, peer: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM sessions WHERE device_id=?1", [peer])?;
         Ok(())
     }
 
