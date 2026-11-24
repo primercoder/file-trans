@@ -2,3 +2,9 @@
 name = "kite-core"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+ed25519-dalek = { version = "3", features = ["pem", "pkcs8", "rand_core"] }
+hex = "0.4"
+rand = "0.9"
+sha2 = "0.10"
