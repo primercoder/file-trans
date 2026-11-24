@@ -1,4 +1,5 @@
-FROM rust:1-slim AS builder
+# Pin the compiler version; the trixie runtime below matches this builder's glibc.
+FROM rust:1.99-slim AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --locked --release -p kite-server

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# State contract: Compose is always stopped on exit (without -v, so docker/data
+# and its database/fingerprint survive for inspection and later runs). Temporary
+# client state is deleted. On failure, full server logs are preserved under
+# /tmp/opencode and the last 50 lines are printed before cleanup.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,19 +14,42 @@ ALICE_NAME="Alice-$RUN_ID"
 BOB_NAME="Bob-$RUN_ID"
 MESSAGE="three-endpoint smoke: hello from A"
 WORK_DIR="$(mktemp -d /tmp/opencode/kite-smoke.XXXXXX)"
-trap 'rm -rf "$WORK_DIR"' EXIT
+cleanup() {
+    status=$?
+    trap - EXIT
+    if [[ "$status" -ne 0 ]]; then
+        log_dir="/tmp/opencode/kite-smoke-failure-$RUN_ID"
+        mkdir -p "$log_dir"
+        docker compose -f "$COMPOSE_FILE" logs --no-color kite-server \
+            >"$log_dir/server.log" 2>&1 || true
+        echo "FAIL: full server log preserved at $log_dir/server.log" >&2
+        tail -n 50 "$log_dir/server.log" >&2
+    fi
+    # Keep the bind-mounted data volume for post-run inspection; only the
+    # generated TLS certificate/fingerprint changes when Compose is rebuilt.
+    docker compose -f "$COMPOSE_FILE" down || true
+    rm -rf "$WORK_DIR"
+    exit "$status"
+}
+trap cleanup EXIT
 
 mkdir -p "$DATA_DIR"
 docker compose -f "$COMPOSE_FILE" up -d --build
 
 healthy=0
-for _ in $(seq 1 60); do
-    if curl -ksS --max-time 2 -o "$WORK_DIR/health.json" -w '%{http_code}' \
+health_deadline=$((SECONDS + 60))
+while (( SECONDS < health_deadline )); do
+    remaining=$((health_deadline - SECONDS))
+    curl_timeout=$((remaining < 2 ? remaining : 2))
+    if curl -ksS --max-time "$curl_timeout" -o "$WORK_DIR/health.json" -w '%{http_code}' \
         "$BASE_URL/healthz" | grep -qx '200'; then
         healthy=1
         break
     fi
-    sleep 1
+    remaining=$((health_deadline - SECONDS))
+    if (( remaining > 0 )); then
+        sleep 1
+    fi
 done
 if [[ "$healthy" -ne 1 ]]; then
     echo "FAIL: server did not become healthy within 60 seconds" >&2
