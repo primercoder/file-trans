@@ -67,12 +67,12 @@ fi
 cargo build --locked --example smoke_node -p kite-core
 NODE="$ROOT/target/debug/examples/smoke_node"
 
-SMOKE_PEER_NAME="$BOB_NAME" SMOKE_MESSAGE="$MESSAGE" \
-    "$NODE" "$ALICE_NAME" "$BASE_URL" "$fingerprint" "$WORK_DIR/alice.db" initiator \
+"$NODE" --server-url "$BASE_URL" --ca-fingerprint "$fingerprint" --role A \
+    --invite-file "$WORK_DIR/alice-invite.txt" --store "$WORK_DIR/alice.db" \
     >"$WORK_DIR/alice.log" 2>&1 &
 alice_pid=$!
-SMOKE_PEER_NAME="$ALICE_NAME" SMOKE_MESSAGE="$MESSAGE" \
-    "$NODE" "$BOB_NAME" "$BASE_URL" "$fingerprint" "$WORK_DIR/bob.db" responder \
+"$NODE" --server-url "$BASE_URL" --ca-fingerprint "$fingerprint" --role B \
+    --invite-file "$WORK_DIR/alice-invite.txt" --store "$WORK_DIR/bob.db" \
     >"$WORK_DIR/bob.log" 2>&1 &
 bob_pid=$!
 
@@ -85,8 +85,8 @@ if ! wait "$bob_pid"; then
 fi
 cat "$WORK_DIR/alice.log" "$WORK_DIR/bob.log"
 for expected in \
-    "REGISTER_OK name=$ALICE_NAME" 'DISCOVERY_OK' 'PAIR_REQUEST_SENT' 'PAIR_OK' 'SEND_OK' \
-    "REGISTER_OK name=$BOB_NAME" 'RECEIVE_OK'; do
+    'REGISTER_OK role=A' 'INVITE_OK' 'PAIR_REQUEST_SENT' 'PAIR_OK' 'TEXT_SENT_OK' \
+    'REGISTER_OK role=B' 'TEXT_RECEIVED_OK' 'SMOKE-OK role=A' 'SMOKE-OK role=B'; do
     if ! grep -qF "$expected" "$WORK_DIR/alice.log" "$WORK_DIR/bob.log"; then
         echo "FAIL: missing smoke assertion: $expected" >&2
         linux_ok=0

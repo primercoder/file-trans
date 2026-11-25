@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use kite_core::Store;
 
 #[cfg(unix)]
