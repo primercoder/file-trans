@@ -283,77 +283,104 @@ impl FileStore {
         index: u32,
         bytes: &[u8],
     ) -> Result<(), ApiError> {
-        let upload = self.upload(state, owner, upload_id).await?;
-        if index >= upload.chunks {
-            return Err(ApiError::invalid("chunk index is out of range"));
-        }
         let chunk_size =
             u64::try_from(bytes.len()).map_err(|_| ApiError::invalid("chunk size is too large"))?;
-        // Reject before touching disk, then account only after the atomic rename.
-        self.account_chunk(state, &upload, index, chunk_size, false)
-            .await?;
-        let directory = self.root.join(&upload.file_id);
-        fs::create_dir_all(&directory)
-            .await
-            .map_err(ApiError::internal)?;
-        // Rename within the same directory makes readers see either complete version.
-        let temporary = directory.join(format!("{}.{}.tmp", index, token()?));
-        fs::write(&temporary, bytes)
-            .await
-            .map_err(ApiError::internal)?;
-        fs::rename(&temporary, directory.join(format!("{index}.bin")))
-            .await
-            .map_err(ApiError::internal)?;
-        self.account_chunk(state, &upload, index, chunk_size, true)
-            .await?;
-        Ok(())
-    }
-
-    async fn account_chunk(
-        &self,
-        state: &AppState,
-        upload: &Upload,
-        index: u32,
-        chunk_size: u64,
-        commit: bool,
-    ) -> Result<(), ApiError> {
+        // One shared lock covers validation, the filesystem mutation and accounting.
+        // This prevents concurrent overwrites from disagreeing about the prior size.
         let connection = state.db.0.lock().await;
-        let transaction = connection.unchecked_transaction()?;
-        let previous: Option<u64> = transaction
+        let upload = connection
+            .query_row(
+                "SELECT file_id,chunks,size FROM files
+                 WHERE upload_id=?1 AND owner=?2 AND status='uploading'",
+                params![upload_id, owner],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(ApiError::not_found)?;
+        let (file_id, chunks, declared_size) = upload;
+        if index >= chunks {
+            return Err(ApiError::invalid("chunk index is out of range"));
+        }
+        let previous: Option<u64> = connection
             .query_row(
                 "SELECT actual_bytes FROM file_chunks WHERE file_id=?1 AND chunk_index=?2",
-                params![upload.file_id, index],
+                params![file_id, index],
                 |row| row.get(0),
             )
             .optional()?;
-        let actual: u64 = transaction.query_row(
+        let actual: u64 = connection.query_row(
             "SELECT actual_bytes FROM files WHERE file_id=?1",
-            [&upload.file_id],
+            [&file_id],
             |row| row.get(0),
         )?;
         let new_actual = actual
             .checked_sub(previous.unwrap_or(0))
             .and_then(|total| total.checked_add(chunk_size))
             .ok_or_else(|| ApiError::invalid("upload size overflow"))?;
-        if new_actual > upload.size {
+        if new_actual > declared_size {
             return Err(ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "payload_too_large",
                 "uploaded ciphertext exceeds the declared file size",
             ));
         }
-        if commit {
+
+        let directory = self.root.join(&file_id);
+        fs::create_dir_all(&directory)
+            .await
+            .map_err(ApiError::internal)?;
+        let temporary = directory.join(format!("{}.{}.tmp", index, token()?));
+        let destination = directory.join(format!("{index}.bin"));
+        let backup = directory.join(format!("{index}.{}.backup", token()?));
+        fs::write(&temporary, bytes)
+            .await
+            .map_err(ApiError::internal)?;
+        let replacing = match fs::rename(&destination, &backup).await {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary).await;
+                return Err(ApiError::internal(error));
+            }
+        };
+        if let Err(error) = fs::rename(&temporary, &destination).await {
+            let _ = fs::remove_file(&temporary).await;
+            if replacing {
+                let _ = fs::rename(&backup, &destination).await;
+            }
+            return Err(ApiError::internal(error));
+        }
+        let accounted = (|| -> Result<(), rusqlite::Error> {
+            let transaction = connection.unchecked_transaction()?;
             transaction.execute(
                 "INSERT INTO file_chunks(file_id,chunk_index,actual_bytes) VALUES(?1,?2,?3)
                  ON CONFLICT(file_id,chunk_index) DO UPDATE SET actual_bytes=excluded.actual_bytes",
-                params![upload.file_id, index, chunk_size],
+                params![file_id, index, chunk_size],
             )?;
             transaction.execute(
                 "UPDATE files SET actual_bytes=?2,received=(SELECT COUNT(*) FROM file_chunks WHERE file_id=?1)
                  WHERE file_id=?1",
-                params![upload.file_id, new_actual],
+                params![file_id, new_actual],
             )?;
-            transaction.commit()?;
+            transaction.commit()
+        })();
+        if let Err(error) = accounted {
+            // Never leave a rejected write unaccounted. Restore a replaced chunk so
+            // its existing DB row still describes the bytes on disk.
+            let _ = fs::remove_file(&destination).await;
+            if replacing {
+                let _ = fs::rename(&backup, &destination).await;
+            }
+            return Err(error.into());
+        }
+        if replacing {
+            let _ = fs::remove_file(backup).await;
         }
         Ok(())
     }

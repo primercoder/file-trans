@@ -114,6 +114,53 @@ impl Db {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
+        // Legacy chunks are files, not blobs. A one-time filesystem-length backfill
+        // makes pre-fix in-flight uploads resumable; missing files stay zero so the
+        // exact-size completion check still detects drift.
+        if !chunk_bytes_column {
+            backfill_actual_bytes(&connection, &data_dir)?;
+        }
         Ok(Self(Mutex::new(connection), data_dir))
     }
+}
+
+fn backfill_actual_bytes(
+    connection: &Connection,
+    data_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let transaction = connection.unchecked_transaction()?;
+    let chunks = {
+        let mut statement = transaction.prepare(
+            "SELECT file_id,chunk_index FROM file_chunks ORDER BY file_id,chunk_index",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (file_id, index) in chunks {
+        let path = data_dir
+            .join("files")
+            .join(&file_id)
+            .join(format!("{index}.bin"));
+        let actual = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        let actual = i64::try_from(actual)?;
+        transaction.execute(
+            "UPDATE file_chunks SET actual_bytes=?3 WHERE file_id=?1 AND chunk_index=?2",
+            rusqlite::params![file_id, index, actual],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE files SET actual_bytes=COALESCE(
+             (SELECT SUM(actual_bytes) FROM file_chunks WHERE file_chunks.file_id=files.file_id),0
+         )",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }

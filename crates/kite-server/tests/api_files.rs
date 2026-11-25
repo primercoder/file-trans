@@ -277,6 +277,75 @@ async fn declared_size_and_chunk_count_are_enforced_without_persisting_excess_by
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_oversized_overwrites_keep_db_and_disk_in_lockstep() {
+    let server = spawn_server().await;
+    let token = register(&server).await;
+    let upload = init(&server, &token, 5, 1).await;
+    let upload_id = upload["upload_id"].as_str().unwrap();
+    let file_id = upload["file_id"].as_str().unwrap();
+    assert_eq!(
+        put_chunk(&server, &token, upload_id, 0, b"valid").await,
+        StatusCode::OK
+    );
+
+    let mut requests = Vec::new();
+    for _ in 0..8 {
+        let client = server.client.clone();
+        let url = format!(
+            "{}/api/v1/files/{upload_id}/chunk/0",
+            server.base
+        );
+        let token = token.clone();
+        requests.push(tokio::spawn(async move {
+            client
+                .put(url)
+                .bearer_auth(token)
+                .body(vec![7; 6])
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    let mut statuses = Vec::new();
+    for request in requests {
+        statuses.push(request.await.unwrap());
+    }
+    assert!(statuses.contains(&StatusCode::PAYLOAD_TOO_LARGE));
+
+    let directory = server._temp.path().join("files").join(file_id);
+    let disk: Vec<(u32, u64)> = std::fs::read_dir(&directory)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.strip_suffix(".bin").map(|index| {
+                (
+                    index.parse().unwrap(),
+                    entry.metadata().unwrap().len(),
+                )
+            })
+        })
+        .collect();
+    let connection = rusqlite::Connection::open(server._temp.path().join("kite.db")).unwrap();
+    let stored: Vec<(u32, u64)> = connection
+        .prepare("SELECT chunk_index,actual_bytes FROM file_chunks WHERE file_id=?1 ORDER BY chunk_index")
+        .unwrap()
+        .query_map([file_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(stored, disk);
+    assert_eq!(stored, vec![(0, 5)]);
+    assert_eq!(std::fs::read(directory.join("0.bin")).unwrap(), b"valid");
+    let actual: u64 = connection
+        .query_row("SELECT actual_bytes FROM files WHERE file_id=?1", [file_id], |row| row.get(0))
+        .unwrap();
+    assert_eq!(actual, 5);
+}
+
 #[tokio::test]
 async fn completion_rejects_wrong_total_even_when_all_chunk_indexes_exist() {
     let server = spawn_server().await;
