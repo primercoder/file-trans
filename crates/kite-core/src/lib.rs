@@ -3,6 +3,7 @@
 mod api_client;
 mod device_name;
 mod engine;
+mod file_crypto;
 mod identity;
 mod ratchet;
 mod store;
@@ -11,6 +12,9 @@ mod x3dh;
 pub use api_client::ApiClient;
 pub use device_name::HwInfo;
 pub use engine::InboxEvent;
+pub use file_crypto::{
+    ChunkCipher, EncryptedChunk, FileCryptoError, FileHeader, FileKey, decrypt_file, encrypt_file,
+};
 pub use identity::Identity;
 pub use ratchet::{RatchetMessage, Session};
 pub use store::Store;
