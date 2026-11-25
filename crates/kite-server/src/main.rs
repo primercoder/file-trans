@@ -12,6 +12,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         kite_server::db::Db::open(&config.db_path)?,
         config.max_storage_bytes,
     );
+    kite_server::filestore::reconcile_pending_cleanup(&state).await;
     let app = kite_server::router(state.clone());
     let health_app = kite_server::health_router(state);
     let tls = match config.tls_paths {

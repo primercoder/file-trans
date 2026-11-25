@@ -81,6 +81,11 @@ impl Db {
                  PRIMARY KEY(file_id, recipient),
                  FOREIGN KEY(file_id) REFERENCES files(file_id) ON DELETE CASCADE,
                  FOREIGN KEY(recipient) REFERENCES devices(device_id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS pending_cleanup (
+                 file_id TEXT PRIMARY KEY,
+                 dir TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
              );",
         )?;
         let data_dir = path

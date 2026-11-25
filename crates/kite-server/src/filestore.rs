@@ -102,11 +102,63 @@ fn enqueue_eviction_notices(
     Ok(())
 }
 
-async fn remove_chunk_directory(directory: &Path) -> Result<(), ApiError> {
+struct CleanupDebt {
+    file_id: String,
+    directory: PathBuf,
+}
+
+async fn remove_chunk_directory(directory: &Path) -> std::io::Result<()> {
     match fs::remove_dir_all(directory).await {
-        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ApiError::internal(error)),
+        result => result,
+    }
+}
+
+async fn cleanup_debt(state: &AppState, file_id: &str, directory: &Path) {
+    match remove_chunk_directory(directory).await {
+        Ok(()) => {
+            if let Err(error) = state
+                .db
+                .0
+                .lock()
+                .await
+                .execute("DELETE FROM pending_cleanup WHERE file_id=?1", [file_id])
+            {
+                tracing::warn!(file_id, %error, "failed to clear completed cleanup debt");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(file_id, path = %directory.display(), %error, "file cleanup deferred");
+        }
+    }
+}
+
+/// Best-effort recovery for cleanup debt committed before a crash or I/O failure.
+/// Reconciliation never prevents the server from starting; debt remains durable for retry.
+pub async fn reconcile_pending_cleanup(state: &AppState) {
+    let debts = {
+        let connection = state.db.0.lock().await;
+        let result = (|| -> Result<Vec<CleanupDebt>, rusqlite::Error> {
+            let mut statement = connection
+                .prepare("SELECT file_id,dir FROM pending_cleanup ORDER BY created_at,file_id")?;
+            let rows = statement.query_map([], |row| {
+                Ok(CleanupDebt {
+                    file_id: row.get(0)?,
+                    directory: PathBuf::from(row.get::<_, String>(1)?),
+                })
+            })?;
+            rows.collect()
+        })();
+        match result {
+            Ok(debts) => debts,
+            Err(error) => {
+                tracing::warn!(%error, "failed to read pending cleanup debt");
+                return;
+            }
+        }
+    };
+    for debt in debts {
+        cleanup_debt(state, &debt.file_id, &debt.directory).await;
     }
 }
 
@@ -151,7 +203,7 @@ impl FileStore {
             upload_id: token()?,
             chunks,
         };
-        let (evicted_directories, notified_recipients) = {
+        let (cleanup_debts, notified_recipients) = {
             let connection = state.db.0.lock().await;
             let transaction = connection.unchecked_transaction()?;
             let mut used: i64 =
@@ -160,7 +212,7 @@ impl FileStore {
                 })?;
             let max_storage_bytes = i64::try_from(self.max_storage_bytes)
                 .map_err(|_| ApiError::internal("storage quota exceeds i64"))?;
-            let mut evicted_directories = Vec::new();
+            let mut cleanup_debts = Vec::new();
             let mut notified_recipients = Vec::new();
             while max_storage_bytes - used < size {
                 let evicted = oldest_eviction_candidate(&transaction, true)?
@@ -173,8 +225,16 @@ impl FileStore {
                 if !evicted.downloaded {
                     enqueue_eviction_notices(&transaction, &evicted.id, &mut notified_recipients)?;
                 }
+                let directory = self.root.join(&evicted.id);
+                transaction.execute(
+                    "INSERT INTO pending_cleanup(file_id,dir,created_at) VALUES(?1,?2,?3)",
+                    params![evicted.id, directory.to_string_lossy(), unix_time()?],
+                )?;
                 transaction.execute("DELETE FROM files WHERE file_id=?1", [&evicted.id])?;
-                evicted_directories.push(self.root.join(evicted.id));
+                cleanup_debts.push(CleanupDebt {
+                    file_id: evicted.id,
+                    directory,
+                });
                 used -= evicted.size;
             }
             transaction.execute(
@@ -190,15 +250,15 @@ impl FileStore {
                 ],
             )?;
             transaction.commit()?;
-            (evicted_directories, notified_recipients)
+            (cleanup_debts, notified_recipients)
         };
         for recipient in notified_recipients {
             crate::api::mailbox::notifier(state, &recipient)
                 .await
                 .notify_waiters();
         }
-        for directory in evicted_directories {
-            remove_chunk_directory(&directory).await?;
+        for debt in cleanup_debts {
+            cleanup_debt(state, &debt.file_id, &debt.directory).await;
         }
         Ok(upload)
     }

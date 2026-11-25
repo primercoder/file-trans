@@ -305,6 +305,82 @@ async fn unreceived_eviction_notifies_every_recipient_before_deleting_chunks() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cleanup_failure_preserves_committed_init_and_startup_reconciles_debt() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let server = spawn_server(8).await;
+    let owner = register(&server, "Owner").await;
+    let recipient = register(&server, "Recipient").await;
+    let existing = upload(&server, &owner, b"12345678").await;
+    deliver(&server, &owner, &recipient, &existing).await;
+    acknowledge(&server, &recipient, &existing).await;
+    let files = server.temp.path().join("files");
+    let evicted = files.join(&existing);
+    std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let (status, upload) = init(&server, &owner.token, 8).await;
+    assert_eq!(status, StatusCode::OK, "{upload}");
+    assert!(upload["upload_id"].is_string());
+    assert_eq!(
+        metadata_status(&server, &owner, &existing).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(storage_used(&server, &owner).await, 8);
+    let debt: i64 = rusqlite::Connection::open(server.temp.path().join("kite.db"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pending_cleanup", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(debt, 1);
+    assert!(evicted.exists());
+
+    std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state = kite_server::state::AppState::new(
+        kite_server::db::Db::open(&server.temp.path().join("kite.db")).unwrap(),
+    );
+    kite_server::filestore::reconcile_pending_cleanup(&state).await;
+    assert!(!evicted.exists());
+    let debt: i64 = rusqlite::Connection::open(server.temp.path().join("kite.db"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pending_cleanup", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(debt, 0);
+}
+
+#[tokio::test]
+async fn reconciliation_removes_real_directories_and_drops_missing_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = kite_server::state::AppState::new(
+        kite_server::db::Db::open(&temp.path().join("kite.db")).unwrap(),
+    );
+    let directory = temp.path().join("orphan");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("0.bin"), b"orphan").unwrap();
+    let missing = temp.path().join("already-gone");
+    let connection = rusqlite::Connection::open(temp.path().join("kite.db")).unwrap();
+    for (file_id, path) in [("orphan", &directory), ("missing", &missing)] {
+        connection
+            .execute(
+                "INSERT INTO pending_cleanup(file_id,dir,created_at) VALUES(?1,?2,1)",
+                rusqlite::params![file_id, path.to_string_lossy()],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    kite_server::filestore::reconcile_pending_cleanup(&state).await;
+    assert!(!directory.exists());
+    let remaining: i64 = state
+        .db
+        .0
+        .lock()
+        .await
+        .query_row("SELECT COUNT(*) FROM pending_cleanup", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
 #[tokio::test]
 async fn oversized_file_is_rejected_without_storing_or_evicting() {
     let server = spawn_server(16).await;
