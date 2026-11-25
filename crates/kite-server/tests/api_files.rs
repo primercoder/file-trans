@@ -156,7 +156,7 @@ async fn out_of_order_upload_complete_meta_and_binary_download() {
         .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-    let chunks: Vec<Vec<u8>> = [1024_usize, 2048, 777]
+    let chunks: Vec<Vec<u8>> = [262_144_usize, 262_144, 777]
         .into_iter()
         .map(|len| {
             let mut bytes = vec![0_u8; len];
@@ -236,15 +236,77 @@ async fn out_of_order_upload_complete_meta_and_binary_download() {
 }
 
 #[tokio::test]
+async fn declared_size_and_chunk_count_are_enforced_without_persisting_excess_bytes() {
+    let server = spawn_server().await;
+    let token = register(&server).await;
+    let upload = init(&server, &token, 1, 1).await;
+    let upload_id = upload["upload_id"].as_str().unwrap();
+    let file_id = upload["file_id"].as_str().unwrap();
+
+    assert_eq!(
+        put_chunk(&server, &token, upload_id, 0, b"too large").await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        complete(&server, &token, upload_id).await,
+        StatusCode::CONFLICT
+    );
+    assert!(!server._temp.path().join("files").join(file_id).exists());
+    let stats: Value = server
+        .client
+        .get(format!("{}/stats", server.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["storage_used"], 1);
+
+    for (size, chunks) in [(0, 0), (1, 0), (1, 2), (256 * 1024 + 1, 1)] {
+        let response = server
+            .client
+            .post(format!("{}/api/v1/files/init", server.base))
+            .bearer_auth(&token)
+            .json(&json!({"size": size, "chunks": chunks}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[tokio::test]
+async fn completion_rejects_wrong_total_even_when_all_chunk_indexes_exist() {
+    let server = spawn_server().await;
+    let token = register(&server).await;
+    let upload = init(&server, &token, 262_150, 2).await;
+    let upload_id = upload["upload_id"].as_str().unwrap();
+    assert_eq!(
+        put_chunk(&server, &token, upload_id, 0, &vec![1; 262_144]).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_chunk(&server, &token, upload_id, 1, b"456").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        complete(&server, &token, upload_id).await,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
 async fn incomplete_upload_is_rejected_and_repeated_chunk_is_overwritten() {
     let server = spawn_server().await;
     let token = register(&server).await;
-    let upload = init(&server, &token, 9, 2).await;
+    let upload = init(&server, &token, 262_147, 2).await;
     let file_id = upload["file_id"].as_str().unwrap();
     let upload_id = upload["upload_id"].as_str().unwrap();
 
     assert_eq!(
-        put_chunk(&server, &token, upload_id, 0, b"first").await,
+        put_chunk(&server, &token, upload_id, 0, &vec![1; 262_144]).await,
         StatusCode::OK
     );
     assert_eq!(

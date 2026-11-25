@@ -10,7 +10,7 @@ use tokio::fs;
 pub const UPLOAD_VALID_FOR_SECS: i64 = 24 * 60 * 60;
 
 use crate::{
-    api::{ApiError, token, unix_time},
+    api::{ApiError, mailbox::MAX_PAYLOAD, token, unix_time},
     state::AppState,
 };
 
@@ -30,6 +30,7 @@ pub struct Upload {
     pub file_id: String,
     pub upload_id: String,
     pub chunks: u32,
+    size: u64,
 }
 
 #[derive(Serialize)]
@@ -191,8 +192,14 @@ impl FileStore {
         size: u64,
         chunks: u32,
     ) -> Result<Upload, ApiError> {
-        if chunks == 0 {
-            return Err(ApiError::invalid("chunks must be greater than zero"));
+        if size == 0 {
+            return Err(ApiError::invalid("size must be greater than zero"));
+        }
+        let expected_chunks = size.div_ceil(MAX_PAYLOAD as u64);
+        if u64::from(chunks) != expected_chunks || chunks == 0 {
+            return Err(ApiError::invalid(
+                "chunks must equal ceil(size / 262144) and be greater than zero",
+            ));
         }
         if size > self.max_storage_bytes {
             return Err(ApiError::new(
@@ -206,6 +213,7 @@ impl FileStore {
             file_id: token()?,
             upload_id: token()?,
             chunks,
+            size: size as u64,
         };
         let (cleanup_debts, notified_recipients) = {
             let connection = state.db.0.lock().await;
@@ -279,6 +287,11 @@ impl FileStore {
         if index >= upload.chunks {
             return Err(ApiError::invalid("chunk index is out of range"));
         }
+        let chunk_size =
+            u64::try_from(bytes.len()).map_err(|_| ApiError::invalid("chunk size is too large"))?;
+        // Reject before touching disk, then account only after the atomic rename.
+        self.account_chunk(state, &upload, index, chunk_size, false)
+            .await?;
         let directory = self.root.join(&upload.file_id);
         fs::create_dir_all(&directory)
             .await
@@ -291,20 +304,57 @@ impl FileStore {
         fs::rename(&temporary, directory.join(format!("{index}.bin")))
             .await
             .map_err(ApiError::internal)?;
+        self.account_chunk(state, &upload, index, chunk_size, true)
+            .await?;
+        Ok(())
+    }
 
+    async fn account_chunk(
+        &self,
+        state: &AppState,
+        upload: &Upload,
+        index: u32,
+        chunk_size: u64,
+        commit: bool,
+    ) -> Result<(), ApiError> {
         let connection = state.db.0.lock().await;
         let transaction = connection.unchecked_transaction()?;
-        let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO file_chunks(file_id,chunk_index) VALUES(?1,?2)",
-            params![upload.file_id, index],
+        let previous: Option<u64> = transaction
+            .query_row(
+                "SELECT actual_bytes FROM file_chunks WHERE file_id=?1 AND chunk_index=?2",
+                params![upload.file_id, index],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let actual: u64 = transaction.query_row(
+            "SELECT actual_bytes FROM files WHERE file_id=?1",
+            [&upload.file_id],
+            |row| row.get(0),
         )?;
-        if inserted == 1 {
-            transaction.execute(
-                "UPDATE files SET received=received+1 WHERE file_id=?1",
-                [&upload.file_id],
-            )?;
+        let new_actual = actual
+            .checked_sub(previous.unwrap_or(0))
+            .and_then(|total| total.checked_add(chunk_size))
+            .ok_or_else(|| ApiError::invalid("upload size overflow"))?;
+        if new_actual > upload.size {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "uploaded ciphertext exceeds the declared file size",
+            ));
         }
-        transaction.commit()?;
+        if commit {
+            transaction.execute(
+                "INSERT INTO file_chunks(file_id,chunk_index,actual_bytes) VALUES(?1,?2,?3)
+                 ON CONFLICT(file_id,chunk_index) DO UPDATE SET actual_bytes=excluded.actual_bytes",
+                params![upload.file_id, index, chunk_size],
+            )?;
+            transaction.execute(
+                "UPDATE files SET actual_bytes=?2,received=(SELECT COUNT(*) FROM file_chunks WHERE file_id=?1)
+                 WHERE file_id=?1",
+                params![upload.file_id, new_actual],
+            )?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -313,13 +363,19 @@ impl FileStore {
         state: &AppState,
         owner: &str,
         upload_id: &str,
-    ) -> Result<Vec<u32>, ApiError> {
+    ) -> Result<(Vec<u32>, String), ApiError> {
         let connection = state.db.0.lock().await;
-        let (file_id, actual_owner) = connection
+        let (file_id, actual_owner, status) = connection
             .query_row(
-                "SELECT file_id,owner FROM files WHERE upload_id=?1 AND status='uploading'",
+                "SELECT file_id,owner,status FROM files WHERE upload_id=?1",
                 [upload_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(ApiError::not_found)?;
@@ -335,7 +391,7 @@ impl FileStore {
         let received = statement
             .query_map([&file_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(received)
+        Ok((received, status))
     }
 
     pub async fn complete(
@@ -347,13 +403,18 @@ impl FileStore {
         let upload = self.upload(state, owner, upload_id).await?;
         let connection = state.db.0.lock().await;
         let transaction = connection.unchecked_transaction()?;
-        let received: u32 = transaction.query_row(
-            "SELECT received FROM files WHERE file_id=?1",
+        let (received, actual_bytes): (u32, u64) = transaction.query_row(
+            "SELECT received,actual_bytes FROM files WHERE file_id=?1",
             [&upload.file_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if received != upload.chunks {
             return Err(ApiError::conflict("not all chunks have been uploaded"));
+        }
+        if actual_bytes != upload.size {
+            return Err(ApiError::conflict(
+                "received ciphertext bytes differ from the declared file size",
+            ));
         }
         transaction.execute(
             "UPDATE files SET status='ready' WHERE file_id=?1",
@@ -485,16 +546,23 @@ impl FileStore {
             .lock()
             .await
             .query_row(
-                "SELECT file_id,chunks FROM files
+                "SELECT file_id,chunks,size FROM files
                  WHERE upload_id=?1 AND owner=?2 AND status='uploading'",
                 params![upload_id, owner],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .map(|(file_id, chunks)| Upload {
+            .map(|(file_id, chunks, size)| Upload {
                 file_id,
                 upload_id: upload_id.to_owned(),
                 chunks,
+                size,
             })
             .ok_or_else(ApiError::not_found)
     }

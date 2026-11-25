@@ -49,6 +49,13 @@ pub async fn enqueue(
     ts: i64,
     file_hint: Option<&str>,
 ) -> Result<i64, ApiError> {
+    if kind == "file_evicted" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_kind",
+            "file_evicted notices are created only by the server",
+        ));
+    }
     let payload = B64
         .decode(encoded_payload)
         .map_err(|_| ApiError::invalid("payload must be standard base64"))?;
@@ -100,10 +107,24 @@ pub async fn enqueue(
             )
             .map_err(|_| ApiError::invalid("file_hint must encode a file ID"))?;
             // Do not let a client grant access to somebody else's upload.
-            transaction.execute(
-                "INSERT OR IGNORE INTO files_recipients(file_id,device_id)
-                 SELECT file_id,?1 FROM files WHERE file_id=?2 AND owner=?3 AND status='ready'",
+            let authorized = transaction.execute(
+                "INSERT INTO files_recipients(file_id,device_id)
+                 SELECT file_id,?1 FROM files WHERE file_id=?2 AND owner=?3 AND status='ready'
+                 ON CONFLICT(file_id,device_id) DO UPDATE SET device_id=excluded.device_id",
                 params![to, file_id, from],
+            )?;
+            if authorized == 0 {
+                // The mailbox insert above rolls back with this error. Do not hand
+                // out an undownloadable offer for a missing, foreign or incomplete file.
+                return Err(ApiError::new(
+                    StatusCode::FAILED_DEPENDENCY,
+                    "file_not_ready",
+                    "file_hint does not identify a ready file owned by the sender",
+                ));
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO files_recipients(file_id,device_id) VALUES(?1,?2)",
+                params![file_id, to],
             )?;
             transaction.execute(
                 "INSERT OR IGNORE INTO file_refs(file_id,recipient,downloaded_at)

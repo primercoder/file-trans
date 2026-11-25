@@ -88,6 +88,27 @@ impl Db {
                  created_at INTEGER NOT NULL
              );",
         )?;
+        // M2: track received ciphertext independently from the declared reservation.
+        let actual_bytes_column = connection
+            .prepare("PRAGMA table_info(files)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|column| column.is_ok_and(|name| name == "actual_bytes"));
+        if !actual_bytes_column {
+            connection.execute(
+                "ALTER TABLE files ADD COLUMN actual_bytes INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let chunk_bytes_column = connection
+            .prepare("PRAGMA table_info(file_chunks)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|column| column.is_ok_and(|name| name == "actual_bytes"));
+        if !chunk_bytes_column {
+            connection.execute(
+                "ALTER TABLE file_chunks ADD COLUMN actual_bytes INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         let data_dir = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

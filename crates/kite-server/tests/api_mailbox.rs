@@ -115,6 +115,39 @@ async fn send(
     (status, body)
 }
 
+async fn initialize_file(server: &Server, sender: &Device, size: usize) -> Value {
+    let response = server
+        .client
+        .post(format!("{}/api/v1/files/init", server.base))
+        .bearer_auth(&sender.token)
+        .json(&json!({"size": size, "chunks": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json::<Value>().await.unwrap()
+}
+
+async fn send_file_with_hint(
+    server: &Server,
+    sender: &Device,
+    to: &str,
+    file_id: &str,
+) -> StatusCode {
+    server
+        .client
+        .post(format!("{}/api/v1/send", server.base))
+        .bearer_auth(&sender.token)
+        .json(&json!({
+            "to": to, "kind": "file", "payload": B64.encode(b"offer"),
+            "ts": now(), "file_hint": B64.encode(file_id),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
 async fn sync(server: &Server, device: &Device, since: i64) -> Vec<Value> {
     server
         .client
@@ -207,6 +240,89 @@ async fn send_cursor_ack_offline_and_validation() {
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(sync(&server, &c, 0).await.len(), 1);
+}
+
+#[tokio::test]
+async fn invalid_file_hints_roll_back_mail_and_eviction_notices_are_server_only() {
+    let server = spawn_server().await;
+    let owner = register(&server, "Owner").await;
+    let foreign = register(&server, "Foreign").await;
+    let recipient = register(&server, "Recipient").await;
+    let incomplete = initialize_file(&server, &owner, 3).await;
+    let uploading_id = incomplete["file_id"].as_str().unwrap();
+    let foreign_id = initialize_file(&server, &foreign, 3).await["file_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for file_id in [&"f".repeat(64), &foreign_id, &uploading_id.to_owned()] {
+        assert_eq!(
+            send_file_with_hint(&server, &owner, &recipient.id, file_id).await,
+            StatusCode::FAILED_DEPENDENCY
+        );
+    }
+    assert!(sync(&server, &recipient, 0).await.is_empty());
+    let connection = rusqlite::Connection::open(server._temp.path().join("kite.db")).unwrap();
+    let mail_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM mailboxes WHERE owner_id=?1",
+            [&recipient.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mail_count, 0);
+    let sequence_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM owner_seq WHERE owner_id=?1",
+            [&recipient.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sequence_count, 0,
+        "failed authorization must roll back all state"
+    );
+    drop(connection);
+
+    let (status, _) = send(
+        &server,
+        &owner,
+        &recipient.id,
+        "file_evicted",
+        br#"{"file_id":"spoofed"}"#,
+        now(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(sync(&server, &recipient, 0).await.is_empty());
+
+    // Reoffering the same ready file to the same recipient remains idempotent.
+    let ready = initialize_file(&server, &owner, 3).await;
+    let file_id = ready["file_id"].as_str().unwrap();
+    let upload_id = ready["upload_id"].as_str().unwrap();
+    let response = server
+        .client
+        .put(format!("{}/api/v1/files/{upload_id}/chunk/0", server.base))
+        .bearer_auth(&owner.token)
+        .body(b"abc".as_slice())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = server
+        .client
+        .post(format!("{}/api/v1/files/{upload_id}/complete", server.base))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    for _ in 0..2 {
+        assert_eq!(
+            send_file_with_hint(&server, &owner, &recipient.id, file_id).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(sync(&server, &recipient, 0).await.len(), 2);
 }
 
 #[tokio::test]

@@ -63,11 +63,11 @@ pub async fn status(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let owner = bearer(&state, &headers).await?;
-    let received = state
+    let (received, status) = state
         .files
         .received_chunks(&state, &owner, &upload_id)
         .await?;
-    Ok(Json(json!({"received": received})))
+    Ok(Json(json!({"received": received, "status": status})))
 }
 
 pub async fn complete(
