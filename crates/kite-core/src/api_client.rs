@@ -14,6 +14,12 @@ use sha2::{Digest, Sha256};
 use crate::{DeviceInfo, EngineError, Result};
 
 #[derive(Debug)]
+pub struct UploadStatus {
+    pub received: Vec<u32>,
+    pub status: String,
+}
+
+#[derive(Debug)]
 struct PinnedCertificate {
     fingerprint: [u8; 32],
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
@@ -253,10 +259,12 @@ impl ApiClient {
         Ok(())
     }
 
-    pub async fn file_upload_status(&self, token: &str, upload_id: &str) -> Result<Vec<u32>> {
+    pub async fn file_upload_status(&self, token: &str, upload_id: &str) -> Result<UploadStatus> {
         #[derive(Deserialize)]
-        struct UploadStatus {
+        struct WireUploadStatus {
             received: Vec<u32>,
+            #[serde(default = "uploading_status")]
+            status: String,
         }
         let response = self
             .client
@@ -264,7 +272,11 @@ impl ApiClient {
             .bearer_auth(token)
             .send()
             .await?;
-        Ok(self.json::<UploadStatus>(response).await?.received)
+        let status = self.json::<WireUploadStatus>(response).await?;
+        Ok(UploadStatus {
+            received: status.received,
+            status: status.status,
+        })
     }
 
     pub async fn complete_file(&self, token: &str, upload_id: &str) -> Result<()> {
@@ -388,6 +400,10 @@ impl ApiClient {
         self.json::<Value>(response).await?;
         Ok(())
     }
+}
+
+fn uploading_status() -> String {
+    "uploading".to_owned()
 }
 
 fn unix_time() -> Result<i64> {

@@ -21,12 +21,14 @@ pub struct FileKey([u8; 32]);
 
 impl FileKey {
     /// Generate a fresh file key from the operating system CSPRNG.
-    pub fn generate() -> Self {
+    ///
+    /// Returns `RandomnessUnavailable` instead of panicking if the OS source fails.
+    pub fn generate() -> Result<Self, FileCryptoError> {
         let mut key = [0_u8; 32];
         OsRng
             .try_fill_bytes(&mut key)
-            .expect("operating system CSPRNG failed");
-        Self(key)
+            .map_err(|_| FileCryptoError::RandomnessUnavailable)?;
+        Ok(Self(key))
     }
 
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -58,6 +60,8 @@ pub struct EncryptedChunk {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FileCryptoError {
+    #[error("operating system randomness is unavailable")]
+    RandomnessUnavailable,
     #[error("failed to read plaintext: {0}")]
     Io(#[from] std::io::Error),
     #[error("bad file header: {0}")]

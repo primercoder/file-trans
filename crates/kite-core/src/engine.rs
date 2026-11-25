@@ -346,7 +346,14 @@ impl Engine {
             .await
     }
 
+    /// Encrypt, upload and durably offer a non-empty file.
+    ///
+    /// Empty inputs return `EngineError::EmptyFile` before any network or store mutation.
+    /// The pending upload remains local until its offer is successfully sent.
     pub async fn send_file(&mut self, peer: &str, name: &str, bytes: &[u8]) -> Result<String> {
+        if bytes.is_empty() {
+            return Err(EngineError::EmptyFile);
+        }
         let (_, status) = self
             .store
             .session(peer)?
@@ -394,7 +401,7 @@ impl Engine {
             }
             (fk, header, chunks)
         } else {
-            let fk = FileKey::generate();
+            let fk = FileKey::generate()?;
             // Leave room for each chunk's AEAD tag under the server's 256 KiB limit.
             let (header, chunks) = encrypt_file(&fk, bytes, 256 * 1024 - 16)?;
             // Intent, including key material, is durable before the first network
@@ -515,8 +522,8 @@ impl Engine {
         pending_hash: [u8; 32],
     ) -> Result<String> {
         let token = self.token()?;
-        let received = match self.api.file_upload_status(&token, &upload_id).await {
-            Ok(received) => received,
+        let upload_status = match self.api.file_upload_status(&token, &upload_id).await {
+            Ok(status) => status,
             Err(EngineError::Server { status, .. }) if status == reqwest::StatusCode::NOT_FOUND => {
                 return Err(EngineError::UploadUnknown { upload_id });
             }
@@ -524,14 +531,15 @@ impl Engine {
         };
         for chunk in chunks
             .iter()
-            .filter(|chunk| !received.contains(&chunk.index))
+            .filter(|chunk| !upload_status.received.contains(&chunk.index))
         {
             self.api
                 .upload_file_chunk(&token, &upload_id, chunk.index, &chunk.ciphertext)
                 .await?;
         }
-        self.api.complete_file(&token, &upload_id).await?;
-        self.store.remove_pending_upload(&pending_hash)?;
+        if upload_status.status != "ready" {
+            self.api.complete_file(&token, &upload_id).await?;
+        }
         let (state, status) = self
             .store
             .session(peer)?
@@ -558,6 +566,9 @@ impl Engine {
         self.api
             .send_file_offer(&token, peer, encode(&message)?, &B64.encode(&file_id))
             .await?;
+        // Keep the recovery intent through upload completion and offer delivery.
+        // A crash after send can only produce an idempotent duplicate offer.
+        self.store.remove_pending_upload(&pending_hash)?;
         Ok(file_id)
     }
 

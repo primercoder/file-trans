@@ -178,7 +178,7 @@ async fn resume_uploads_only_missing_chunks_and_recipient_downloads_original() {
     let (mut alice, mut bob, token, _alice_id, bob_id) = paired_clients(&temp, &server).await;
     let mut original = vec![0_u8; CHUNK_SIZE * 2 + 777];
     rng().fill_bytes(&mut original);
-    let fk = FileKey::generate();
+    let fk = FileKey::generate().unwrap();
     let (header, chunks) = encrypt_file(&fk, &*original, CHUNK_SIZE).unwrap();
     assert_eq!(header.total_chunks, 3);
     let size = chunks
@@ -214,7 +214,8 @@ async fn resume_uploads_only_missing_chunks_and_recipient_downloads_original() {
         .file_upload_status(&token, &upload_id)
         .await
         .unwrap();
-    assert_eq!(status, vec![0, 2]);
+    assert_eq!(status.received, vec![0, 2]);
+    assert_eq!(status.status, "uploading");
     alice
         .resume_upload(&file_id, &upload_id, &original)
         .await
@@ -225,13 +226,13 @@ async fn resume_uploads_only_missing_chunks_and_recipient_downloads_original() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resume_after_all_chunks_completes_without_reupload() {
+async fn resume_after_server_complete_resends_offer_and_clears_recovery_intent() {
     let server = TestServer::spawn();
     let temp = tempfile::tempdir().unwrap();
-    let (mut alice, _bob, token, _alice_id, bob_id) = paired_clients(&temp, &server).await;
+    let (mut alice, mut bob, token, _alice_id, bob_id) = paired_clients(&temp, &server).await;
     let mut original = vec![0_u8; CHUNK_SIZE * 2 + 17];
     rng().fill_bytes(&mut original);
-    let fk = FileKey::generate();
+    let fk = FileKey::generate().unwrap();
     let (header, chunks) = encrypt_file(&fk, &*original, CHUNK_SIZE).unwrap();
     let size = chunks
         .iter()
@@ -253,20 +254,29 @@ async fn resume_after_all_chunks_completes_without_reupload() {
             .await
             .unwrap();
     }
+    for chunk in &chunks {
+        api(&server)
+            .upload_file_chunk(&token, &upload_id, chunk.index, &chunk.ciphertext)
+            .await
+            .unwrap();
+    }
+    // Model a crash after complete but before offer delivery: the local intent remains.
+    api(&server)
+        .complete_file(&token, &upload_id)
+        .await
+        .unwrap();
+    assert_eq!(pending_count(&temp), 1);
+
     alice
         .resume_upload(&file_id, &upload_id, &original)
         .await
         .unwrap();
     assert_eq!(pending_count(&temp), 0);
-    let status: String = server
-        .db()
-        .query_row(
-            "SELECT status FROM files WHERE file_id=?1",
-            [&file_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(status, "ready");
+    assert!(matches!(
+        bob.poll_once().await.unwrap().as_slice(),
+        [InboxEvent::FileOffer { file_id: offered, .. }] if *offered == file_id
+    ));
+    assert_eq!(bob.download_file(&file_id).await.unwrap().1, original);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -274,7 +284,10 @@ async fn status_is_owner_only_and_unknown_upload_is_not_found() {
     let server = TestServer::spawn();
     let temp = tempfile::tempdir().unwrap();
     let (_alice, _bob, token, _alice_id, _bob_id) = paired_clients(&temp, &server).await;
-    let (_file_id, upload_id) = api(&server).init_file(&token, 32, 3).await.unwrap();
+    let (_file_id, upload_id) = api(&server)
+        .init_file(&token, 2 * 256 * 1024 + 16, 3)
+        .await
+        .unwrap();
     for index in [2, 0] {
         api(&server)
             .upload_file_chunk(&token, &upload_id, index, &[index as u8; 16])
@@ -320,7 +333,7 @@ async fn send_file_retry_resumes_pending_content_without_second_init() {
     let temp = tempfile::tempdir().unwrap();
     let (mut alice, _bob, token, alice_id, bob_id) = paired_clients(&temp, &server).await;
     let original = vec![42_u8; CHUNK_SIZE * 2 + 99];
-    let fk = FileKey::generate();
+    let fk = FileKey::generate().unwrap();
     let (header, chunks) = encrypt_file(&fk, &*original, CHUNK_SIZE).unwrap();
     let size = chunks
         .iter()

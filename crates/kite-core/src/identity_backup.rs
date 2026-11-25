@@ -13,7 +13,9 @@
 //!
 //! Backups have single-active-device semantics: after import, the old device must
 //! not be used concurrently against the same peers, or the Double Ratchet forks.
-//! Retire the old device's store after migration.
+//! Retire the old device's store after migration. Pending file offers
+//! (undownloaded files) and in-flight uploads are NOT migrated; download pending
+//! files before migration.
 
 use std::path::Path;
 
@@ -68,6 +70,9 @@ struct BackupSessionPayload {
 impl Engine {
     /// Export identity, paired sessions and known peers without any network I/O.
     ///
+    /// Pending file offers (undownloaded files) and in-flight uploads are not
+    /// migrated. Download pending files before migration.
+    ///
     /// Backups have single-active-device semantics: after import, do not use the
     /// old device concurrently against the same peers, or the Double Ratchet
     /// forks. Retire the old device's store after migration.
@@ -103,6 +108,8 @@ impl Engine {
 
     /// Restore into a fresh store; an existing identity or sessions are rejected.
     /// No registration or other network I/O occurs: re-registration is a UI choice.
+    /// Pending file offers and in-flight uploads are not restored; download pending
+    /// files before migration.
     ///
     /// Backups have single-active-device semantics: after import, do not use the
     /// old device concurrently against the same peers, or the Double Ratchet

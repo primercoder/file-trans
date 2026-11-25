@@ -8,7 +8,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::{Signer, SigningKey, pkcs8::DecodePrivateKey as _};
-use kite_core::{Engine, Identity, InboxEvent, generate_spk};
+use kite_core::{Engine, EngineError, Identity, InboxEvent, generate_spk};
 use rand::{RngCore as _, rng};
 use reqwest::StatusCode;
 use rusqlite::Connection;
@@ -191,6 +191,27 @@ async fn file_round_trip_recipient_authorization_ack_and_idempotent_download() {
     let (repeated_name, repeated) = bob.download_file(&file_id).await.unwrap();
     assert_eq!(repeated_name, name);
     assert_eq!(repeated, original);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_file_is_rejected_before_upload_or_local_pending_state() {
+    let server = TestServer::spawn();
+    let temp = tempfile::tempdir().unwrap();
+    let (mut alice, _bob, _alice_id, bob_id) = paired_clients(&temp, &server).await;
+    assert!(matches!(
+        alice.send_file(&bob_id, "empty", b"").await,
+        Err(EngineError::EmptyFile)
+    ));
+    let pending: i64 = Connection::open(temp.path().join("alice.db"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM pending_uploads", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pending, 0);
+    let files: i64 = server
+        .db()
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(files, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

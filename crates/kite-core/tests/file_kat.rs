@@ -9,7 +9,7 @@ const CHUNK_SIZE: usize = 256 * 1024;
 fn round_trip_three_chunks() {
     let mut plaintext = vec![0_u8; 700 * 1024];
     OsRng.try_fill_bytes(&mut plaintext).unwrap();
-    let fk = FileKey::generate();
+    let fk = FileKey::generate().unwrap();
 
     let (header, chunks) = encrypt_file(&fk, plaintext.as_slice(), CHUNK_SIZE).unwrap();
     assert_eq!(header.total_chunks, 3);
@@ -27,7 +27,7 @@ fn round_trip_three_chunks() {
 #[test]
 fn out_of_order_chunks_are_buffered_and_emitted_in_order() {
     let plaintext: Vec<u8> = (0..(CHUNK_SIZE * 2 + 123)).map(|n| n as u8).collect();
-    let fk = FileKey::generate();
+    let fk = FileKey::generate().unwrap();
     let (header, chunks) = encrypt_file(&fk, plaintext.as_slice(), CHUNK_SIZE).unwrap();
     let mut cipher = ChunkCipher::new(&fk, header).unwrap();
 
@@ -38,7 +38,7 @@ fn out_of_order_chunks_are_buffered_and_emitted_in_order() {
 
 #[test]
 fn tampered_chunk_is_a_mac_failure() {
-    let fk = FileKey::generate();
+    let fk = FileKey::generate().unwrap();
     let (header, mut chunks) = encrypt_file(&fk, b"authenticated".as_slice(), CHUNK_SIZE).unwrap();
     chunks[0].ciphertext[3] ^= 1;
 
@@ -50,7 +50,7 @@ fn tampered_chunk_is_a_mac_failure() {
 
 #[test]
 fn aad_rejects_cross_file_index_transplant() {
-    let fk = FileKey::generate();
+    let fk = FileKey::generate().unwrap();
     let (_, chunks_a) =
         encrypt_file(&fk, vec![0x11; CHUNK_SIZE * 2].as_slice(), CHUNK_SIZE).unwrap();
     let (header_b, chunks_b) =
@@ -69,7 +69,7 @@ fn aad_rejects_cross_file_index_transplant() {
 
 #[test]
 fn wrong_chunk_count_is_a_typed_error() {
-    let fk = FileKey::generate();
+    let fk = FileKey::generate().unwrap();
     let plaintext = vec![7_u8; CHUNK_SIZE * 3];
     let (header, chunks) = encrypt_file(&fk, plaintext.as_slice(), CHUNK_SIZE).unwrap();
 
@@ -84,7 +84,7 @@ fn wrong_chunk_count_is_a_typed_error() {
 
 #[test]
 fn bad_header_is_rejected() {
-    let fk = FileKey::generate();
+    let fk = FileKey::generate().unwrap();
     let (mut header, chunks) = encrypt_file(&fk, b"data".as_slice(), CHUNK_SIZE).unwrap();
     header.version ^= 1;
 

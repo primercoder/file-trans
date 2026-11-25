@@ -68,6 +68,8 @@ pub enum EngineError {
     Integer(#[from] std::num::ParseIntError),
     #[error("configuration error: {0}")]
     Configuration(String),
+    #[error("empty files cannot be sent")]
+    EmptyFile,
     #[error("upload is expired or unknown: {upload_id}")]
     UploadUnknown { upload_id: String },
     #[error("identity backup passphrase is wrong or ciphertext was tampered with")]
