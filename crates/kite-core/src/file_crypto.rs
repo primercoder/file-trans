@@ -8,6 +8,7 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use rand::{TryRngCore as _, rngs::OsRng};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const DOMAIN: &[u8; 12] = b"kite-file-v1";
@@ -31,10 +32,14 @@ impl FileKey {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    pub fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
 }
 
 /// Metadata needed to authenticate and reassemble a ciphertext stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct FileHeader {
     pub magic: [u8; 4],
     pub version: u8,

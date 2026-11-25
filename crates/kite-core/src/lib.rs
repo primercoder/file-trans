@@ -59,6 +59,8 @@ pub enum EngineError {
     Identity(#[from] ed25519_dalek::pkcs8::Error),
     #[error("cryptography failed: {0:?}")]
     Crypto(CryptoError),
+    #[error("file cryptography failed: {0}")]
+    FileCrypto(#[from] FileCryptoError),
     #[error("invalid UTF-8 message: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("integer conversion failed: {0}")]

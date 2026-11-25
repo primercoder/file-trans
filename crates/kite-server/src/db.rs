@@ -64,7 +64,24 @@ impl Db {
                 chunk_index INTEGER NOT NULL,
                 PRIMARY KEY(file_id, chunk_index),
                 FOREIGN KEY(file_id) REFERENCES files(file_id) ON DELETE CASCADE
-            );",
+            );
+             -- Delivery authorization is derived only from the opaque file_hint,
+             -- never from the encrypted filename or file key.
+             CREATE TABLE IF NOT EXISTS files_recipients (
+                 file_id TEXT NOT NULL,
+                 device_id TEXT NOT NULL,
+                 PRIMARY KEY(file_id, device_id),
+                 FOREIGN KEY(file_id) REFERENCES files(file_id) ON DELETE CASCADE,
+                 FOREIGN KEY(device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS file_refs (
+                 file_id TEXT NOT NULL,
+                 recipient TEXT NOT NULL,
+                 downloaded_at INTEGER,
+                 PRIMARY KEY(file_id, recipient),
+                 FOREIGN KEY(file_id) REFERENCES files(file_id) ON DELETE CASCADE,
+                 FOREIGN KEY(recipient) REFERENCES devices(device_id) ON DELETE CASCADE
+             );",
         )?;
         let data_dir = path
             .parent()

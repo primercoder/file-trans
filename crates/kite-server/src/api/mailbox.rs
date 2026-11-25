@@ -24,6 +24,9 @@ pub struct SendRequest {
     pub kind: String,
     pub payload: String,
     pub ts: i64,
+    /// Opaque routing metadata for file delivery authorization. It is never
+    /// returned by sync; the encrypted payload remains the sole key/name carrier.
+    pub file_hint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -44,6 +47,7 @@ pub async fn enqueue(
     kind: String,
     encoded_payload: &str,
     ts: i64,
+    file_hint: Option<&str>,
 ) -> Result<i64, ApiError> {
     let payload = B64
         .decode(encoded_payload)
@@ -88,6 +92,25 @@ pub async fn enqueue(
             "INSERT INTO mailboxes(owner_id,seq,from_id,kind,payload,ts) VALUES(?1,?2,?3,?4,?5,?6)",
             params![to, seq, from, kind, payload, ts],
         )?;
+        if kind == "file" {
+            let encoded = file_hint.ok_or_else(|| ApiError::invalid("file_hint is required"))?;
+            let file_id = String::from_utf8(
+                B64.decode(encoded)
+                    .map_err(|_| ApiError::invalid("file_hint must be standard base64"))?,
+            )
+            .map_err(|_| ApiError::invalid("file_hint must encode a file ID"))?;
+            // Do not let a client grant access to somebody else's upload.
+            transaction.execute(
+                "INSERT OR IGNORE INTO files_recipients(file_id,device_id)
+                 SELECT file_id,?1 FROM files WHERE file_id=?2 AND owner=?3 AND status='ready'",
+                params![to, file_id, from],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO file_refs(file_id,recipient,downloaded_at)
+                 SELECT file_id,?1,NULL FROM files WHERE file_id=?2 AND owner=?3 AND status='ready'",
+                params![to, file_id, from],
+            )?;
+        }
         transaction.commit()?;
         seq
     };
@@ -119,6 +142,7 @@ pub async fn send(
         request.kind,
         &request.payload,
         request.ts,
+        request.file_hint.as_deref(),
     )
     .await?;
     Ok(Json(json!({"seq": seq})))

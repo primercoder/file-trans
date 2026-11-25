@@ -130,6 +130,65 @@ impl FileStore {
         Ok(upload.file_id)
     }
 
+    pub async fn authorize_download(
+        &self,
+        state: &AppState,
+        file_id: &str,
+        device_id: &str,
+    ) -> Result<(), ApiError> {
+        let connection = state.db.0.lock().await;
+        let owner = connection
+            .query_row(
+                "SELECT owner FROM files WHERE file_id=?1",
+                [file_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(ApiError::not_found)?;
+        if owner == device_id {
+            return Ok(());
+        }
+        let recipient = connection
+            .query_row(
+                "SELECT 1 FROM files_recipients WHERE file_id=?1 AND device_id=?2",
+                params![file_id, device_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if recipient.is_none() {
+            return Err(ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "forbidden",
+                "file was not delivered to this device",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn acknowledge_download(
+        &self,
+        state: &AppState,
+        file_id: &str,
+        device_id: &str,
+    ) -> Result<(), ApiError> {
+        self.authorize_download(state, file_id, device_id).await?;
+        if device_id
+            == state.db.0.lock().await.query_row(
+                "SELECT owner FROM files WHERE file_id=?1",
+                [file_id],
+                |row| row.get::<_, String>(0),
+            )?
+        {
+            return Ok(());
+        }
+        state.db.0.lock().await.execute(
+            "UPDATE file_refs SET downloaded_at=COALESCE(downloaded_at,?3)
+             WHERE file_id=?1 AND recipient=?2",
+            params![file_id, device_id, unix_time()?],
+        )?;
+        Ok(())
+    }
+
     pub async fn metadata(&self, state: &AppState, file_id: &str) -> Result<Metadata, ApiError> {
         state
             .db

@@ -72,7 +72,11 @@ pub async fn metadata(
     Path(file_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<crate::filestore::Metadata>, ApiError> {
-    bearer(&state, &headers).await?;
+    let device_id = bearer(&state, &headers).await?;
+    state
+        .files
+        .authorize_download(&state, &file_id, &device_id)
+        .await?;
     Ok(Json(state.files.metadata(&state, &file_id).await?))
 }
 
@@ -81,7 +85,24 @@ pub async fn download_chunk(
     Path((file_id, index)): Path<(String, u32)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    bearer(&state, &headers).await?;
+    let device_id = bearer(&state, &headers).await?;
+    state
+        .files
+        .authorize_download(&state, &file_id, &device_id)
+        .await?;
     let bytes = state.files.read_chunk(&state, &file_id, index).await?;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
+}
+
+pub async fn ack_download(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let device_id = bearer(&state, &headers).await?;
+    state
+        .files
+        .acknowledge_download(&state, &file_id, &device_id)
+        .await?;
+    Ok(Json(json!({"status": "downloaded"})))
 }

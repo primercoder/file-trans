@@ -20,16 +20,48 @@ use sha2::{Digest as _, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{
-    ApiClient, BundleDto, CryptoError, DeviceInfo, EngineError, Identity, IdentityState,
-    InitiatorKeys, PreKeyBundle, RatchetMessage, ResponderKeys, Result, Session, Store,
-    generate_spk, store::EntryOutcome,
+    ApiClient, BundleDto, ChunkCipher, CryptoError, DeviceInfo, EncryptedChunk, EngineError,
+    FileHeader, FileKey, Identity, IdentityState, InitiatorKeys, PreKeyBundle, RatchetMessage,
+    ResponderKeys, Result, Session, Store, encrypt_file, generate_spk, store::EntryOutcome,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum InboxEvent {
-    PairRequest { from: String, name: String },
-    PairResponse { from: String, accepted: bool },
-    Message { from: String, text: String },
+    PairRequest {
+        from: String,
+        name: String,
+    },
+    PairResponse {
+        from: String,
+        accepted: bool,
+    },
+    Message {
+        from: String,
+        text: String,
+    },
+    FileOffer {
+        file_id: String,
+        name: String,
+        size: u64,
+    },
+    FileUnavailable {
+        file_id: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct FileOfferBody {
+    file_id: String,
+    name: String,
+    size: u64,
+    fk_b64: String,
+    header_b64: String,
+    content_hash_b64: String,
+}
+
+#[derive(Deserialize)]
+struct FileUnavailableNotice {
+    file_id: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -292,6 +324,93 @@ impl Engine {
             .await
     }
 
+    pub async fn send_file(&mut self, peer: &str, name: &str, bytes: &[u8]) -> Result<String> {
+        let (state, status) = self
+            .store
+            .session(peer)?
+            .ok_or_else(|| EngineError::Protocol("peer is not paired".into()))?;
+        if status != "paired" {
+            return Err(EngineError::Protocol(
+                "pairing has not been accepted".into(),
+            ));
+        }
+        let fk = FileKey::generate();
+        // Leave room for each chunk's AEAD tag under the server's 256 KiB limit.
+        let (header, chunks) = encrypt_file(&fk, bytes, 256 * 1024 - 16)?;
+        let size = chunks
+            .iter()
+            .try_fold(0_u64, |total, chunk| {
+                total.checked_add(chunk.ciphertext.len() as u64)
+            })
+            .ok_or_else(|| EngineError::Protocol("encrypted file size overflow".into()))?;
+        let token = self.token()?;
+        let (file_id, upload_id) = self
+            .api
+            .init_file(&token, size, header.total_chunks)
+            .await?;
+        for chunk in &chunks {
+            self.api
+                .upload_file_chunk(&token, &upload_id, chunk.index, &chunk.ciphertext)
+                .await?;
+        }
+        self.api.complete_file(&token, &upload_id).await?;
+        let body = FileOfferBody {
+            file_id: file_id.clone(),
+            name: name.to_owned(),
+            size: bytes.len() as u64,
+            fk_b64: B64.encode(fk.to_bytes()),
+            header_b64: B64.encode(bincode::serialize(&header)?),
+            content_hash_b64: B64.encode(header.content_hash),
+        };
+        let mut session: Session = bincode::deserialize(&state)?;
+        let ad = session_ad(&session);
+        let message = session.encrypt(&serde_json::to_vec(&body)?, &ad)?;
+        self.store
+            .save_session(peer, &bincode::serialize(&session)?, "paired")?;
+        // file_hint is deliberately only the opaque file ID. It authorizes delivery;
+        // the key and filename never leave this session-encrypted body.
+        self.api
+            .send_file_offer(&token, peer, encode(&message)?, &B64.encode(&file_id))
+            .await?;
+        Ok(file_id)
+    }
+
+    pub async fn download_file(&mut self, file_id: &str) -> Result<(String, Vec<u8>)> {
+        let pending = self
+            .store
+            .pending_file(file_id)?
+            .ok_or_else(|| EngineError::Protocol("file offer is not pending locally".into()))?;
+        let header: FileHeader = bincode::deserialize(&pending.header)?;
+        let token = self.token()?;
+        let metadata = self.api.file_metadata(&token, file_id).await?;
+        if metadata.chunks != header.total_chunks {
+            return Err(EngineError::Protocol(
+                "server chunk count differs from authenticated header".into(),
+            ));
+        }
+        let mut cipher = ChunkCipher::new(&FileKey::from_bytes(pending.fk), header.clone())?;
+        let mut plaintext = Vec::new();
+        for index in 0..header.total_chunks {
+            let ciphertext = self.api.download_file_chunk(&token, file_id, index).await?;
+            plaintext.extend(cipher.push_chunk(EncryptedChunk { index, ciphertext })?);
+        }
+        if plaintext.len() as u64 != pending.size {
+            return Err(EngineError::Protocol(
+                "decrypted size differs from authenticated file offer".into(),
+            ));
+        }
+        // The same hash is carried in the authenticated header; this explicit check
+        // also binds the offer's content_hash field to the decrypted stream.
+        if pending.content_hash != header.content_hash {
+            return Err(EngineError::Protocol(
+                "file offer content hash differs from header".into(),
+            ));
+        }
+        self.store.mark_file_downloaded(file_id)?;
+        self.api.ack_file_download(&token, file_id).await?;
+        Ok((pending.name, plaintext))
+    }
+
     pub async fn poll_once(&mut self) -> Result<Vec<InboxEvent>> {
         let token = self.token()?;
         let cursor = self.store.cursor()?;
@@ -328,6 +447,8 @@ impl Engine {
             "pair_req" => self.receive_pair_request(&entry.from, &entry.payload),
             "pair_resp" => self.receive_pair_response(&entry.from, &entry.payload),
             "msg" => self.receive_message(&entry.from, &entry.payload),
+            "file" => self.receive_file_offer(&entry.from, &entry.payload),
+            "file_evicted" => receive_file_unavailable(&entry.payload),
             _ => Ok(EntryOutcome::failed()),
         }
     }
@@ -398,6 +519,52 @@ impl Engine {
                 from.to_owned(),
                 bincode::serialize(&session)?,
                 "paired".into(),
+            )),
+            ..EntryOutcome::default()
+        })
+    }
+
+    fn receive_file_offer(&self, from: &str, payload: &str) -> Result<EntryOutcome> {
+        let (state, status) = self
+            .store
+            .session(from)?
+            .ok_or_else(|| EngineError::Protocol("file offer from unpaired peer".into()))?;
+        if status != "paired" {
+            return Err(EngineError::Protocol(
+                "file offer before pairing accepted".into(),
+            ));
+        }
+        let mut session: Session = bincode::deserialize(&state)?;
+        let ad = session_ad(&session);
+        let message: RatchetMessage = decode(payload)?;
+        let plaintext = session.decrypt(&message, &ad)?;
+        let body: FileOfferBody = serde_json::from_slice(&plaintext)?;
+        let fk = decode_array(&body.fk_b64)?;
+        let header: FileHeader = bincode::deserialize(&B64.decode(&body.header_b64)?)?;
+        let content_hash = decode_array(&body.content_hash_b64)?;
+        if content_hash != header.content_hash || body.file_id.len() > 128 {
+            return Err(EngineError::Protocol("inconsistent file offer".into()));
+        }
+        let event = InboxEvent::FileOffer {
+            file_id: body.file_id.clone(),
+            name: body.name.clone(),
+            size: body.size,
+        };
+        Ok(EntryOutcome {
+            event: Some(event),
+            session: Some((
+                from.to_owned(),
+                bincode::serialize(&session)?,
+                "paired".into(),
+            )),
+            pending_file: Some((
+                body.file_id,
+                from.to_owned(),
+                body.name,
+                body.size,
+                fk,
+                B64.decode(&body.header_b64)?,
+                content_hash,
             )),
             ..EntryOutcome::default()
         })
@@ -484,6 +651,22 @@ impl Engine {
             .clone()
             .ok_or_else(|| EngineError::Protocol("device is not registered".into()))
     }
+}
+
+/// Server-authored eviction notices are unauthenticated plaintext JSON, not peer
+/// ciphertext. They are advisory hints only: they never alter pending-file state,
+/// authorize a download, or prove that an eviction actually occurred.
+fn receive_file_unavailable(payload: &str) -> Result<EntryOutcome> {
+    let notice: FileUnavailableNotice = serde_json::from_slice(&B64.decode(payload)?)?;
+    if notice.file_id.is_empty() || notice.file_id.len() > 128 {
+        return Err(EngineError::Protocol("invalid file eviction hint".into()));
+    }
+    Ok(EntryOutcome {
+        event: Some(InboxEvent::FileUnavailable {
+            file_id: notice.file_id,
+        }),
+        ..EntryOutcome::default()
+    })
 }
 
 fn decode_bundle(dto: BundleDto) -> Result<PreKeyBundle> {

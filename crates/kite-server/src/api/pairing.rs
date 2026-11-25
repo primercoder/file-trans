@@ -27,6 +27,7 @@ pub async fn request(
         "pair_req".to_owned(),
         &request.payload,
         unix_time()?,
+        None,
     )
     .await?;
     Ok(Json(json!({"seq": seq})))
@@ -55,6 +56,7 @@ pub async fn respond(
         "pair_resp".to_owned(),
         &request.payload,
         unix_time()?,
+        None,
     )
     .await?;
     Ok(Json(json!({"seq": seq})))

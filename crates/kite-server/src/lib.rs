@@ -41,6 +41,10 @@ pub fn router(state: AppState) -> Router {
             post(api::files::complete),
         )
         .route("/api/v1/files/{file_id}/meta", get(api::files::metadata))
+        .route(
+            "/api/v1/files/{file_id}/ack-download",
+            post(api::files::ack_download),
+        )
         .route("/api/v1/pair/request", post(api::pairing::request))
         .route("/api/v1/pair/respond", post(api::pairing::respond))
         .with_state(state)

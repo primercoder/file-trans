@@ -19,10 +19,23 @@ pub struct IdentityState {
     pub opks: Vec<(u32, [u8; 32])>,
 }
 
+pub struct PendingFile {
+    pub peer: String,
+    pub name: String,
+    pub size: u64,
+    pub fk: [u8; 32],
+    pub header: Vec<u8>,
+    pub content_hash: [u8; 32],
+    pub downloaded: bool,
+}
+
+pub type NewPendingFile = (String, String, String, u64, [u8; 32], Vec<u8>, [u8; 32]);
+
 /// All local effects of one mailbox entry, committed with its disposition/cursor.
 #[derive(Default)]
 pub struct EntryOutcome {
     pub event: Option<InboxEvent>,
+    pub pending_file: Option<NewPendingFile>,
     pub session: Option<(String, Vec<u8>, String)>,
     pub remove_session: Option<String>,
     pub pending: Option<(String, String, [u8; 32])>,
@@ -69,6 +82,11 @@ impl Store {
              CREATE TABLE IF NOT EXISTS handshake_nonces(
                  device_id TEXT NOT NULL, ek_pub_hash BLOB NOT NULL,
                  PRIMARY KEY(device_id, ek_pub_hash)
+             );
+             CREATE TABLE IF NOT EXISTS pending_files(
+                 file_id TEXT PRIMARY KEY, peer TEXT NOT NULL, name TEXT NOT NULL,
+                 size INTEGER NOT NULL, fk BLOB NOT NULL, header BLOB NOT NULL,
+                 content_hash BLOB NOT NULL, downloaded INTEGER NOT NULL DEFAULT 0
              );",
         )?;
         Ok(Self { connection })
@@ -173,6 +191,66 @@ impl Store {
             .is_some())
     }
 
+    pub fn pending_file(&self, file_id: &str) -> Result<Option<PendingFile>> {
+        self.connection
+            .query_row(
+                "SELECT peer,name,size,fk,header,content_hash,downloaded
+                 FROM pending_files WHERE file_id=?1",
+                [file_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, bool>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(peer, name, size, fk, header, content_hash, downloaded)| {
+                Ok::<PendingFile, rusqlite::Error>(PendingFile {
+                    peer,
+                    name,
+                    size: u64::try_from(size).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    fk: fk.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            3,
+                            "fk".into(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })?,
+                    header,
+                    content_hash: content_hash.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            5,
+                            "content_hash".into(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })?,
+                    downloaded,
+                })
+            })
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_file_downloaded(&self, file_id: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE pending_files SET downloaded=1 WHERE file_id=?1",
+            [file_id],
+        )?;
+        Ok(())
+    }
+
     /// Atomically persists all entry effects, its durable disposition and cursor.
     /// ACK is deliberately outside this transaction: it is server-side cleanup.
     pub fn commit_entry(&mut self, seq: i64, outcome: EntryOutcome) -> Result<Option<InboxEvent>> {
@@ -192,6 +270,19 @@ impl Store {
         }
         if let Some(peer) = &outcome.remove_pending {
             transaction.execute("DELETE FROM pending_pairing WHERE device_id=?1", [peer])?;
+        }
+        if let Some((file_id, peer, name, size, fk, header, content_hash)) = &outcome.pending_file {
+            let size = i64::try_from(*size).map_err(|_| {
+                EngineError::Protocol("file size exceeds SQLite integer range".into())
+            })?;
+            transaction.execute(
+                "INSERT INTO pending_files(file_id,peer,name,size,fk,header,content_hash,downloaded)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,0)
+                 ON CONFLICT(file_id) DO UPDATE SET peer=excluded.peer,name=excluded.name,
+                 size=excluded.size,fk=excluded.fk,header=excluded.header,
+                 content_hash=excluded.content_hash,downloaded=0",
+                params![file_id, peer, name, size, fk.as_slice(), header, content_hash.as_slice()],
+            )?;
         }
         if let Some(id) = outcome.consume_opk {
             let mut state = identity(&transaction)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;

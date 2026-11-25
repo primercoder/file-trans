@@ -97,6 +97,18 @@ struct TokenResponse {
     token: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct FileUpload {
+    file_id: String,
+    upload_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileMetadata {
+    pub size: u64,
+    pub chunks: u32,
+}
+
 impl ApiClient {
     pub fn new(base_url: &str, server_fingerprint: &str) -> Result<Self> {
         let fingerprint: [u8; 32] = hex::decode(server_fingerprint.trim())
@@ -174,6 +186,131 @@ impl ApiClient {
             .post(format!("{}/api/v1/send", self.base_url))
             .bearer_auth(token)
             .json(&json!({"to": to, "kind": kind, "payload": payload, "ts": unix_time()?}))
+            .send()
+            .await?;
+        self.json::<Value>(response).await?;
+        Ok(())
+    }
+
+    pub async fn send_file_offer(
+        &self,
+        token: &str,
+        to: &str,
+        payload: String,
+        file_hint: &str,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .post(format!("{}/api/v1/send", self.base_url))
+            .bearer_auth(token)
+            .json(&json!({
+                "to": to,
+                "kind": "file",
+                "payload": payload,
+                "ts": unix_time()?,
+                "file_hint": file_hint,
+            }))
+            .send()
+            .await?;
+        self.json::<Value>(response).await?;
+        Ok(())
+    }
+
+    pub async fn init_file(&self, token: &str, size: u64, chunks: u32) -> Result<(String, String)> {
+        let response = self
+            .client
+            .post(format!("{}/api/v1/files/init", self.base_url))
+            .bearer_auth(token)
+            .json(&json!({"size": size, "chunks": chunks}))
+            .send()
+            .await?;
+        let upload = self.json::<FileUpload>(response).await?;
+        Ok((upload.file_id, upload.upload_id))
+    }
+
+    pub async fn upload_file_chunk(
+        &self,
+        token: &str,
+        upload_id: &str,
+        index: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let response = self
+            .client
+            .put(format!(
+                "{}/api/v1/files/{upload_id}/chunk/{index}",
+                self.base_url
+            ))
+            .bearer_auth(token)
+            .body(bytes.to_vec())
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = response.text().await?;
+            return Err(EngineError::Server { status, message });
+        }
+        Ok(())
+    }
+
+    pub async fn complete_file(&self, token: &str, upload_id: &str) -> Result<()> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/v1/files/{upload_id}/complete",
+                self.base_url
+            ))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        self.json::<Value>(response).await?;
+        Ok(())
+    }
+
+    pub async fn file_metadata(&self, token: &str, file_id: &str) -> Result<FileMetadata> {
+        let response = self
+            .client
+            .get(format!("{}/api/v1/files/{file_id}/meta", self.base_url))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        self.json(response).await
+    }
+
+    pub async fn download_file_chunk(
+        &self,
+        token: &str,
+        file_id: &str,
+        index: u32,
+    ) -> Result<Vec<u8>> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/api/v1/files/{file_id}/chunk/{index}",
+                self.base_url
+            ))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            return Err(EngineError::Server {
+                status,
+                message: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        Ok(bytes.to_vec())
+    }
+
+    pub async fn ack_file_download(&self, token: &str, file_id: &str) -> Result<()> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/v1/files/{file_id}/ack-download",
+                self.base_url
+            ))
+            .bearer_auth(token)
             .send()
             .await?;
         self.json::<Value>(response).await?;
