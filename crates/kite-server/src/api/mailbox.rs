@@ -118,7 +118,7 @@ pub async fn enqueue(
     Ok(seq)
 }
 
-async fn notifier(state: &AppState, owner: &str) -> Arc<Notify> {
+pub(crate) async fn notifier(state: &AppState, owner: &str) -> Arc<Notify> {
     state
         .notifications
         .lock()

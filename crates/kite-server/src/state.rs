@@ -21,7 +21,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Db) -> Self {
-        let files = FileStore::new(db.1.clone());
+        Self::with_quota(db, crate::config::DEFAULT_MAX_STORAGE_BYTES)
+    }
+
+    pub fn with_quota(db: Db, max_storage_bytes: u64) -> Self {
+        let files = FileStore::new(db.1.clone(), max_storage_bytes);
         Self {
             db: Arc::new(db),
             files,

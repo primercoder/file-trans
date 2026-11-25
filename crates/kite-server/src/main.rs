@@ -7,12 +7,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
     let config = kite_server::config::Config::from_env()?;
     // Print unconditionally: operators must see the effective value even without RUST_LOG.
-    // Enforcement is deliberately deferred to M2.
-    println!(
-        "Kite max storage bytes: {} (enforced in M2)",
-        config.max_storage_bytes
+    println!("Kite max storage bytes: {}", config.max_storage_bytes);
+    let state = kite_server::state::AppState::with_quota(
+        kite_server::db::Db::open(&config.db_path)?,
+        config.max_storage_bytes,
     );
-    let state = kite_server::state::AppState::new(kite_server::db::Db::open(&config.db_path)?);
     let app = kite_server::router(state.clone());
     let health_app = kite_server::health_router(state);
     let tls = match config.tls_paths {
