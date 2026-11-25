@@ -57,6 +57,19 @@ pub async fn upload_chunk(
     Ok(StatusCode::OK)
 }
 
+pub async fn status(
+    State(state): State<AppState>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = bearer(&state, &headers).await?;
+    let received = state
+        .files
+        .received_chunks(&state, &owner, &upload_id)
+        .await?;
+    Ok(Json(json!({"received": received})))
+}
+
 pub async fn complete(
     State(state): State<AppState>,
     Path(upload_id): Path<String>,

@@ -29,6 +29,17 @@ pub struct PendingFile {
     pub downloaded: bool,
 }
 
+pub struct PendingUpload {
+    pub upload_id: Option<String>,
+    pub file_id: Option<String>,
+    pub peer: String,
+    pub name: String,
+    pub size: u64,
+    pub fk: [u8; 32],
+    pub header: Vec<u8>,
+    pub content_hash: [u8; 32],
+}
+
 pub type NewPendingFile = (String, String, String, u64, [u8; 32], Vec<u8>, [u8; 32]);
 
 /// All local effects of one mailbox entry, committed with its disposition/cursor.
@@ -87,6 +98,11 @@ impl Store {
                  file_id TEXT PRIMARY KEY, peer TEXT NOT NULL, name TEXT NOT NULL,
                  size INTEGER NOT NULL, fk BLOB NOT NULL, header BLOB NOT NULL,
                  content_hash BLOB NOT NULL, downloaded INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS pending_uploads(
+                 content_hash BLOB PRIMARY KEY, upload_id TEXT UNIQUE, file_id TEXT UNIQUE,
+                 peer TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL,
+                 fk BLOB NOT NULL, header BLOB NOT NULL, created_at INTEGER NOT NULL
              );",
         )?;
         Ok(Self { connection })
@@ -241,6 +257,113 @@ impl Store {
             })
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub fn save_pending_upload(&self, upload: &PendingUpload, created_at: i64) -> Result<()> {
+        let size = i64::try_from(upload.size)
+            .map_err(|_| EngineError::Protocol("file size exceeds SQLite integer range".into()))?;
+        self.connection.execute(
+            "INSERT INTO pending_uploads(content_hash,upload_id,file_id,peer,name,size,fk,header,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![upload.content_hash.as_slice(), upload.upload_id, upload.file_id,
+                upload.peer, upload.name, size, upload.fk.as_slice(), upload.header, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn bind_pending_upload(
+        &self,
+        content_hash: &[u8; 32],
+        upload_id: &str,
+        file_id: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE pending_uploads SET upload_id=?2,file_id=?3 WHERE content_hash=?1",
+            params![content_hash.as_slice(), upload_id, file_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_upload(&self, content_hash: &[u8; 32]) -> Result<Option<PendingUpload>> {
+        self.connection
+            .query_row(
+                "SELECT upload_id,file_id,peer,name,size,fk,header FROM pending_uploads
+                 WHERE content_hash=?1",
+                [content_hash.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(upload_id, file_id, peer, name, size, fk, header)| {
+                Ok::<PendingUpload, rusqlite::Error>(PendingUpload {
+                    upload_id,
+                    file_id,
+                    peer,
+                    name,
+                    size: u64::try_from(size).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    fk: fk.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            5,
+                            "fk".into(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })?,
+                    header,
+                    content_hash: *content_hash,
+                })
+            })
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn pending_upload_by_id(&self, upload_id: &str) -> Result<Option<PendingUpload>> {
+        let content_hash: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT content_hash FROM pending_uploads WHERE upload_id=?1",
+                [upload_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        self.pending_upload_for_hash(content_hash)
+    }
+
+    fn pending_upload_for_hash(
+        &self,
+        content_hash: Option<Vec<u8>>,
+    ) -> Result<Option<PendingUpload>> {
+        content_hash
+            .map(|hash| {
+                let hash: [u8; 32] = hash.try_into().map_err(|_| {
+                    EngineError::Protocol("pending upload has invalid content hash".into())
+                })?;
+                self.pending_upload(&hash)?
+                    .ok_or_else(|| EngineError::Protocol("pending upload disappeared".into()))
+            })
+            .transpose()
+    }
+
+    pub fn remove_pending_upload(&self, content_hash: &[u8; 32]) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM pending_uploads WHERE content_hash=?1",
+            [content_hash.as_slice()],
+        )?;
+        Ok(())
     }
 
     pub fn mark_file_downloaded(&self, file_id: &str) -> Result<()> {

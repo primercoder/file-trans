@@ -36,6 +36,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/files/{upload_id}/chunk/{index}",
             put(api::files::upload_chunk).get(api::files::download_chunk),
         )
+        .route("/api/v1/files/{upload_id}/status", get(api::files::status))
         .route(
             "/api/v1/files/{upload_id}/complete",
             post(api::files::complete),

@@ -5,6 +5,10 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use serde::Serialize;
 use tokio::fs;
 
+/// Incomplete uploads remain resumable for 24 hours. M2 deliberately has no
+/// expiry cleanup job; this constant documents the retention guarantee.
+pub const UPLOAD_VALID_FOR_SECS: i64 = 24 * 60 * 60;
+
 use crate::{
     api::{ApiError, token, unix_time},
     state::AppState,
@@ -302,6 +306,36 @@ impl FileStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub async fn received_chunks(
+        &self,
+        state: &AppState,
+        owner: &str,
+        upload_id: &str,
+    ) -> Result<Vec<u32>, ApiError> {
+        let connection = state.db.0.lock().await;
+        let (file_id, actual_owner) = connection
+            .query_row(
+                "SELECT file_id,owner FROM files WHERE upload_id=?1 AND status='uploading'",
+                [upload_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(ApiError::not_found)?;
+        if actual_owner != owner {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "upload belongs to another device",
+            ));
+        }
+        let mut statement = connection
+            .prepare("SELECT chunk_index FROM file_chunks WHERE file_id=?1 ORDER BY chunk_index")?;
+        let received = statement
+            .query_map([&file_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(received)
     }
 
     pub async fn complete(

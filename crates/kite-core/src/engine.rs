@@ -22,7 +22,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::{
     ApiClient, BundleDto, ChunkCipher, CryptoError, DeviceInfo, EncryptedChunk, EngineError,
     FileHeader, FileKey, Identity, IdentityState, InitiatorKeys, PreKeyBundle, RatchetMessage,
-    ResponderKeys, Result, Session, Store, encrypt_file, generate_spk, store::EntryOutcome,
+    ResponderKeys, Result, Session, Store, encrypt_file, generate_spk,
+    store::{EntryOutcome, PendingUpload},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -325,6 +326,191 @@ impl Engine {
     }
 
     pub async fn send_file(&mut self, peer: &str, name: &str, bytes: &[u8]) -> Result<String> {
+        let (_, status) = self
+            .store
+            .session(peer)?
+            .ok_or_else(|| EngineError::Protocol("peer is not paired".into()))?;
+        if status != "paired" {
+            return Err(EngineError::Protocol(
+                "pairing has not been accepted".into(),
+            ));
+        }
+        let plaintext_hash: [u8; 32] = Sha256::digest(bytes).into();
+        let mut pending = self.store.pending_upload(&plaintext_hash)?;
+        let resumable = if let Some(upload) = pending.as_ref()
+            && let (Some(upload_id), Some(file_id)) = (&upload.upload_id, &upload.file_id)
+        {
+            match self.api.file_upload_status(&self.token()?, upload_id).await {
+                Ok(_) => Some((file_id.clone(), upload_id.clone())),
+                Err(EngineError::Server { status, .. })
+                    if status == reqwest::StatusCode::NOT_FOUND =>
+                {
+                    self.store.remove_pending_upload(&upload.content_hash)?;
+                    pending = None;
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+
+        let (fk, header, chunks) = if let Some(upload) = &pending {
+            let fk = FileKey::from_bytes(upload.fk);
+            let stored_header: FileHeader = bincode::deserialize(&upload.header)?;
+            // Re-encryption is deterministic: each nonce derives from fk+index and
+            // AAD from index+total_chunks+chunk_size. The stored key therefore
+            // reproduces exactly the ciphertext already accepted by the server.
+            let (header, chunks) = encrypt_file(&fk, bytes, stored_header.chunk_size as usize)?;
+            if header != stored_header
+                || upload.size != bytes.len() as u64
+                || upload.peer != peer
+                || upload.name != name
+            {
+                return Err(EngineError::Protocol(
+                    "pending upload does not match plaintext, recipient, or filename".into(),
+                ));
+            }
+            (fk, header, chunks)
+        } else {
+            let fk = FileKey::generate();
+            // Leave room for each chunk's AEAD tag under the server's 256 KiB limit.
+            let (header, chunks) = encrypt_file(&fk, bytes, 256 * 1024 - 16)?;
+            // Intent, including key material, is durable before the first network
+            // mutation. The server IDs are bound immediately after init returns.
+            self.store.save_pending_upload(
+                &PendingUpload {
+                    upload_id: None,
+                    file_id: None,
+                    peer: peer.to_owned(),
+                    name: name.to_owned(),
+                    size: bytes.len() as u64,
+                    fk: fk.to_bytes(),
+                    header: bincode::serialize(&header)?,
+                    content_hash: plaintext_hash,
+                },
+                unix_time()?,
+            )?;
+            (fk, header, chunks)
+        };
+        let size = chunks
+            .iter()
+            .try_fold(0_u64, |total, chunk| {
+                total.checked_add(chunk.ciphertext.len() as u64)
+            })
+            .ok_or_else(|| EngineError::Protocol("encrypted file size overflow".into()))?;
+        let token = self.token()?;
+        let (file_id, upload_id) = if let Some(ids) = resumable {
+            ids
+        } else {
+            let (file_id, upload_id) = self
+                .api
+                .init_file(&token, size, header.total_chunks)
+                .await?;
+            self.store
+                .bind_pending_upload(&plaintext_hash, &upload_id, &file_id)?;
+            (file_id, upload_id)
+        };
+        self.upload_missing_and_deliver(
+            peer,
+            name,
+            bytes,
+            fk,
+            header,
+            chunks,
+            file_id,
+            upload_id,
+            plaintext_hash,
+        )
+        .await
+    }
+
+    pub async fn resume_upload(
+        &mut self,
+        file_id: &str,
+        upload_id: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        match self.api.file_upload_status(&self.token()?, upload_id).await {
+            Ok(_) => {}
+            Err(EngineError::Server { status, .. }) if status == reqwest::StatusCode::NOT_FOUND => {
+                return Err(EngineError::UploadUnknown {
+                    upload_id: upload_id.to_owned(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        let pending = self
+            .store
+            .pending_upload_by_id(upload_id)?
+            .ok_or_else(|| EngineError::Protocol("no matching pending upload locally".into()))?;
+        if let Some(expected) = &pending.file_id
+            && expected != file_id
+        {
+            return Err(EngineError::Protocol(
+                "file ID does not match pending upload".into(),
+            ));
+        }
+        let plaintext_hash: [u8; 32] = Sha256::digest(bytes).into();
+        if plaintext_hash != pending.content_hash {
+            return Err(EngineError::Protocol(
+                "plaintext does not match pending upload".into(),
+            ));
+        }
+        let fk = FileKey::from_bytes(pending.fk);
+        let header: FileHeader = bincode::deserialize(&pending.header)?;
+        let (regenerated, chunks) = encrypt_file(&fk, bytes, header.chunk_size as usize)?;
+        if regenerated != header {
+            return Err(EngineError::Protocol(
+                "plaintext does not reproduce pending upload".into(),
+            ));
+        }
+        self.upload_missing_and_deliver(
+            &pending.peer,
+            &pending.name,
+            bytes,
+            fk,
+            header,
+            chunks,
+            file_id.to_owned(),
+            upload_id.to_owned(),
+            pending.content_hash,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_missing_and_deliver(
+        &mut self,
+        peer: &str,
+        name: &str,
+        bytes: &[u8],
+        fk: FileKey,
+        header: FileHeader,
+        chunks: Vec<EncryptedChunk>,
+        file_id: String,
+        upload_id: String,
+        pending_hash: [u8; 32],
+    ) -> Result<String> {
+        let token = self.token()?;
+        let received = match self.api.file_upload_status(&token, &upload_id).await {
+            Ok(received) => received,
+            Err(EngineError::Server { status, .. }) if status == reqwest::StatusCode::NOT_FOUND => {
+                return Err(EngineError::UploadUnknown { upload_id });
+            }
+            Err(error) => return Err(error),
+        };
+        for chunk in chunks
+            .iter()
+            .filter(|chunk| !received.contains(&chunk.index))
+        {
+            self.api
+                .upload_file_chunk(&token, &upload_id, chunk.index, &chunk.ciphertext)
+                .await?;
+        }
+        self.api.complete_file(&token, &upload_id).await?;
+        self.store.remove_pending_upload(&pending_hash)?;
         let (state, status) = self
             .store
             .session(peer)?
@@ -334,26 +520,6 @@ impl Engine {
                 "pairing has not been accepted".into(),
             ));
         }
-        let fk = FileKey::generate();
-        // Leave room for each chunk's AEAD tag under the server's 256 KiB limit.
-        let (header, chunks) = encrypt_file(&fk, bytes, 256 * 1024 - 16)?;
-        let size = chunks
-            .iter()
-            .try_fold(0_u64, |total, chunk| {
-                total.checked_add(chunk.ciphertext.len() as u64)
-            })
-            .ok_or_else(|| EngineError::Protocol("encrypted file size overflow".into()))?;
-        let token = self.token()?;
-        let (file_id, upload_id) = self
-            .api
-            .init_file(&token, size, header.total_chunks)
-            .await?;
-        for chunk in &chunks {
-            self.api
-                .upload_file_chunk(&token, &upload_id, chunk.index, &chunk.ciphertext)
-                .await?;
-        }
-        self.api.complete_file(&token, &upload_id).await?;
         let body = FileOfferBody {
             file_id: file_id.clone(),
             name: name.to_owned(),
@@ -363,8 +529,7 @@ impl Engine {
             content_hash_b64: B64.encode(header.content_hash),
         };
         let mut session: Session = bincode::deserialize(&state)?;
-        let ad = session_ad(&session);
-        let message = session.encrypt(&serde_json::to_vec(&body)?, &ad)?;
+        let message = session.encrypt(&serde_json::to_vec(&body)?, &session_ad(&session))?;
         self.store
             .save_session(peer, &bincode::serialize(&session)?, "paired")?;
         // file_hint is deliberately only the opaque file ID. It authorizes delivery;

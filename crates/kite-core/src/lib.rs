@@ -67,6 +67,8 @@ pub enum EngineError {
     Integer(#[from] std::num::ParseIntError),
     #[error("configuration error: {0}")]
     Configuration(String),
+    #[error("upload is expired or unknown: {upload_id}")]
+    UploadUnknown { upload_id: String },
     #[error("protocol error: {0}")]
     Protocol(String),
 }

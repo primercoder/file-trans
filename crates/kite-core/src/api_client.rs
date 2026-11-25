@@ -253,6 +253,20 @@ impl ApiClient {
         Ok(())
     }
 
+    pub async fn file_upload_status(&self, token: &str, upload_id: &str) -> Result<Vec<u32>> {
+        #[derive(Deserialize)]
+        struct UploadStatus {
+            received: Vec<u32>,
+        }
+        let response = self
+            .client
+            .get(format!("{}/api/v1/files/{upload_id}/status", self.base_url))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        Ok(self.json::<UploadStatus>(response).await?.received)
+    }
+
     pub async fn complete_file(&self, token: &str, upload_id: &str) -> Result<()> {
         let response = self
             .client
