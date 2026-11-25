@@ -5,6 +5,7 @@ mod device_name;
 mod engine;
 mod file_crypto;
 mod identity;
+mod identity_backup;
 mod ratchet;
 mod store;
 mod x3dh;
@@ -69,6 +70,12 @@ pub enum EngineError {
     Configuration(String),
     #[error("upload is expired or unknown: {upload_id}")]
     UploadUnknown { upload_id: String },
+    #[error("identity backup passphrase is wrong or ciphertext was tampered with")]
+    BackupAuthentication,
+    #[error("identity backup format is invalid: {0}")]
+    BackupBadFormat(String),
+    #[error("identity backup is truncated")]
+    BackupTruncated,
     #[error("protocol error: {0}")]
     Protocol(String),
 }

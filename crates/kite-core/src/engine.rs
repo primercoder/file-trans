@@ -95,7 +95,7 @@ struct PairResponseBody {
 }
 
 pub struct Engine {
-    store: Store,
+    pub(crate) store: Store,
     api: ApiClient,
     identity: Identity,
     device_id: String,
@@ -142,6 +142,27 @@ impl Engine {
             token,
             spk_private,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_backup_parts(
+        store: Store,
+        api: ApiClient,
+        identity: Identity,
+        device_id: String,
+        name: Option<String>,
+        token: Option<String>,
+        spk_private: [u8; 32],
+    ) -> Self {
+        Self {
+            store,
+            api,
+            identity,
+            device_id,
+            name,
+            token,
+            spk_private,
+        }
     }
 
     pub fn device_id(&self) -> &str {

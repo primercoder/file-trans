@@ -19,6 +19,20 @@ pub struct IdentityState {
     pub opks: Vec<(u32, [u8; 32])>,
 }
 
+pub struct BackupIdentityState {
+    pub private_pem: String,
+    pub token: Option<String>,
+    pub spk_private: [u8; 32],
+    pub name: Option<String>,
+    pub opks: Vec<(u32, [u8; 32])>,
+}
+
+pub struct BackupSession {
+    pub peer: String,
+    pub state: Vec<u8>,
+    pub status: String,
+}
+
 pub struct PendingFile {
     pub peer: String,
     pub name: String,
@@ -110,6 +124,48 @@ impl Store {
 
     pub fn identity(&self) -> Result<Option<IdentityState>> {
         identity(&self.connection)
+    }
+
+    pub fn backup(&self) -> Result<(IdentityState, Vec<BackupSession>)> {
+        let state = identity(&self.connection)?
+            .ok_or_else(|| EngineError::Protocol("identity is not initialized".into()))?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT device_id,state,status FROM sessions ORDER BY device_id")?;
+        let sessions = statement
+            .query_map([], |row| {
+                Ok(BackupSession {
+                    peer: row.get(0)?,
+                    state: row.get(1)?,
+                    status: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((state, sessions))
+    }
+
+    pub fn restore_backup(
+        path: impl AsRef<Path>,
+        state: &BackupIdentityState,
+        sessions: &[BackupSession],
+    ) -> Result<Self> {
+        let store = Self::open(path)?;
+        let transaction = store.connection.unchecked_transaction()?;
+        save_identity(
+            &transaction,
+            &IdentityState {
+                private_pem: state.private_pem.clone(),
+                token: state.token.clone(),
+                spk_private: state.spk_private,
+                name: state.name.clone(),
+                opks: state.opks.clone(),
+            },
+        )?;
+        for session in sessions {
+            save_session(&transaction, &session.peer, &session.state, &session.status)?;
+        }
+        transaction.commit()?;
+        Ok(store)
     }
 
     pub fn save_identity(&self, state: &IdentityState) -> Result<()> {
