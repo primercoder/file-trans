@@ -12,6 +12,7 @@ use crate::{db::Db, state::AppState};
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod filestore;
 pub mod state;
 pub mod tls;
 
@@ -30,6 +31,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/send", post(api::mailbox::send))
         .route("/api/v1/sync", get(api::mailbox::sync))
         .route("/api/v1/ack", post(api::mailbox::ack))
+        .route("/api/v1/files/init", post(api::files::init))
+        .route(
+            "/api/v1/files/{upload_id}/chunk/{index}",
+            put(api::files::upload_chunk).get(api::files::download_chunk),
+        )
+        .route(
+            "/api/v1/files/{upload_id}/complete",
+            post(api::files::complete),
+        )
+        .route("/api/v1/files/{file_id}/meta", get(api::files::metadata))
         .route("/api/v1/pair/request", post(api::pairing::request))
         .route("/api/v1/pair/respond", post(api::pairing::respond))
         .with_state(state)

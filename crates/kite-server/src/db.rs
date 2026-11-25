@@ -1,10 +1,10 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 
 /// A single SQLite connection shared by handlers; WAL permits concurrent readers.
-pub struct Db(pub Mutex<Connection>);
+pub struct Db(pub Mutex<Connection>, pub PathBuf);
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
@@ -47,8 +47,30 @@ impl Db {
                 key BLOB NOT NULL,
                 UNIQUE(owner_id, opk_id),
                 FOREIGN KEY(owner_id) REFERENCES devices(device_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS files (
+                file_id TEXT PRIMARY KEY,
+                upload_id TEXT NOT NULL UNIQUE,
+                owner TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                chunks INTEGER NOT NULL,
+                received INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL CHECK(status IN ('uploading', 'ready')),
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(owner) REFERENCES devices(device_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS file_chunks (
+                file_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                PRIMARY KEY(file_id, chunk_index),
+                FOREIGN KEY(file_id) REFERENCES files(file_id) ON DELETE CASCADE
             );",
         )?;
-        Ok(Self(Mutex::new(connection)))
+        let data_dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Ok(Self(Mutex::new(connection), data_dir))
     }
 }
