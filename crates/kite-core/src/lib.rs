@@ -74,6 +74,8 @@ pub enum EngineError {
     BackupAuthentication,
     #[error("identity backup format is invalid: {0}")]
     BackupBadFormat(String),
+    #[error("identity backup target store already contains an identity or sessions")]
+    BackupTargetNotEmpty,
     #[error("identity backup is truncated")]
     BackupTruncated,
     #[error("protocol error: {0}")]

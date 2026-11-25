@@ -7,8 +7,13 @@
 //! V1 always uses the fixed Argon2id parameters below. They are also recorded
 //! in the encrypted JSON for information and future evolution, but cannot be
 //! consulted before deriving the KEK. V2 may move parameters to an authenticated
-//! plaintext header extension. Import never registers with the server: that is
-//! a post-import UI decision. An existing registration token is restored.
+//! plaintext header extension. Import requires a fresh store and never registers
+//! with the server: that is a post-import UI decision. An existing registration
+//! token is restored.
+//!
+//! Backups have single-active-device semantics: after import, the old device must
+//! not be used concurrently against the same peers, or the Double Ratchet forks.
+//! Retire the old device's store after migration.
 
 use std::path::Path;
 
@@ -62,6 +67,10 @@ struct BackupSessionPayload {
 
 impl Engine {
     /// Export identity, paired sessions and known peers without any network I/O.
+    ///
+    /// Backups have single-active-device semantics: after import, do not use the
+    /// old device concurrently against the same peers, or the Double Ratchet
+    /// forks. Retire the old device's store after migration.
     pub fn export_identity(&self, passphrase: &str) -> Result<Vec<u8>> {
         let (state, sessions) = self.store.backup()?;
         let known_peers = sessions
@@ -92,7 +101,12 @@ impl Engine {
         seal(passphrase, &serde_json::to_vec(&payload)?)
     }
 
-    /// Restore into a fresh store. No registration or other network I/O occurs.
+    /// Restore into a fresh store; an existing identity or sessions are rejected.
+    /// No registration or other network I/O occurs: re-registration is a UI choice.
+    ///
+    /// Backups have single-active-device semantics: after import, do not use the
+    /// old device concurrently against the same peers, or the Double Ratchet
+    /// forks. Retire the old device's store after migration.
     pub fn import_identity(
         store_path: impl AsRef<Path>,
         base_url: &str,

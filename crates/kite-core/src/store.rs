@@ -151,6 +151,14 @@ impl Store {
     ) -> Result<Self> {
         let store = Self::open(path)?;
         let transaction = store.connection.unchecked_transaction()?;
+        let occupied: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identity) OR EXISTS(SELECT 1 FROM sessions)",
+            [],
+            |row| row.get(0),
+        )?;
+        if occupied {
+            return Err(EngineError::BackupTargetNotEmpty);
+        }
         save_identity(
             &transaction,
             &IdentityState {
