@@ -4,7 +4,16 @@ export interface Status {
   deviceId: string | null;
   name: string | null;
   serverUrl: string | null;
-  fingerprint: string | null;
+  theme: string;
+  locale: string;
+}
+
+export interface AccountView {
+  id: string;
+  serverUrl: string;
+  deviceId: string | null;
+  name: string | null;
+  active: boolean;
 }
 
 export interface DeviceInfo {
@@ -34,6 +43,11 @@ export interface ChatView {
   fileName: string | null;
   size: number | null;
   ts: number;
+}
+
+export interface PollResult {
+  messages: ChatView[];
+  devicesChanged: boolean;
 }
 
 export interface GroupMember {

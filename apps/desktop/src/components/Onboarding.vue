@@ -1,26 +1,31 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { api } from "../api";
+import { translate } from "../i18n";
 import type { Status } from "../types";
 
-const emit = defineEmits<{ (e: "ready", status: Status): void; (e: "error", message: string): void }>();
+const props = defineProps<{ locale: "zh" | "en"; initialServer?: string; canCancel?: boolean }>();
+const emit = defineEmits<{ ready: [Status]; error: [string]; cancel: [] }>();
 
-const serverUrl = ref("https://127.0.0.1:8443");
-const fingerprint = ref("");
+const server = ref(props.initialServer || "https://");
 const name = ref("");
+const pin = ref("");
+const advanced = ref(false);
 const busy = ref(false);
+const error = ref("");
+
+const t = (key: string, vars?: Record<string, string | number>) => translate(props.locale, key, vars);
+const canSubmit = computed(() => server.value.trim().length > 8 && name.value.trim().length > 0);
 
 async function submit() {
-  if (!name.value.trim()) {
-    emit("error", "请填写设备名称");
-    return;
-  }
+  if (!canSubmit.value || busy.value) return;
   busy.value = true;
+  error.value = "";
   try {
-    const status = await api.register(serverUrl.value.trim(), fingerprint.value.trim(), name.value.trim());
+    const status = await api.register(server.value.trim(), pin.value.trim() || null, name.value.trim());
     emit("ready", status);
-  } catch (error) {
-    emit("error", String(error));
+  } catch (cause) {
+    error.value = String(cause);
   } finally {
     busy.value = false;
   }
@@ -29,33 +34,49 @@ async function submit() {
 
 <template>
   <div class="onboarding">
-    <div class="card">
-      <div class="logo-row">
-        <img src="/kite-icon.png" alt="Kite" class="logo" />
-        <div>
-          <h1>Kite</h1>
-          <p class="muted">端到端加密的文件与消息传输</p>
-        </div>
+    <div class="onboarding-card">
+      <img src="/kite-icon.png" alt="" class="onboarding-logo" />
+      <div class="onboarding-heading">
+        <h1>{{ t("app.name") }}</h1>
+        <p class="muted">{{ t("app.tagline") }}</p>
       </div>
-      <label>
-        服务器地址
-        <input v-model="serverUrl" placeholder="https://your-server:8443" />
+
+      <label class="field">
+        <span>{{ t("onboarding.server") }}</span>
+        <input
+          v-model="server"
+          type="url"
+          inputmode="url"
+          autocomplete="off"
+          spellcheck="false"
+          :placeholder="t('onboarding.serverHint')"
+        />
       </label>
-      <label>
-        服务器证书指纹（SHA-256）
-        <input v-model="fingerprint" placeholder="64 位十六进制" spellcheck="false" />
-        <span class="hint">首次启动时服务端会打印指纹，也可在部署目录的 fingerprint.txt 中查看</span>
+      <label class="field">
+        <span>{{ t("onboarding.name") }}</span>
+        <input v-model="name" autocomplete="off" :placeholder="t('onboarding.nameHint')" maxlength="40" />
       </label>
-      <label>
-        设备名称
-        <input v-model="name" placeholder="例如：办公室-台式机" @keyup.enter="submit" />
-      </label>
-      <button class="primary" :disabled="busy" @click="submit">
-        {{ busy ? "正在注册…" : "注册并连接" }}
+
+      <button class="link" type="button" @click="advanced = !advanced">
+        {{ t("onboarding.advanced") }}
       </button>
-      <p class="muted small">
-        设备身份由本机生成的密钥决定，不随网络变化；请妥善保管。
-      </p>
+      <label v-if="advanced" class="field">
+        <span>{{ t("onboarding.pin") }}</span>
+        <input
+          v-model="pin"
+          autocomplete="off"
+          spellcheck="false"
+          :placeholder="t('onboarding.pinHint')"
+        />
+      </label>
+
+      <p v-if="error" class="error-text">{{ error }}</p>
+      <button class="primary block" :disabled="!canSubmit || busy" @click="submit">
+        {{ busy ? t("onboarding.registering") : t("onboarding.submit") }}
+      </button>
+      <button v-if="canCancel" class="link" type="button" @click="emit('cancel')">
+        {{ t("common.cancel") }}
+      </button>
     </div>
   </div>
 </template>

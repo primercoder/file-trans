@@ -115,7 +115,7 @@ fn identity_token(temp: &TempDir, name: &str) -> String {
 }
 
 fn api(server: &TestServer) -> ApiClient {
-    ApiClient::new(&server.base_url, &server.fingerprint).unwrap()
+    ApiClient::new(&server.base_url, Some(&server.fingerprint)).unwrap()
 }
 
 async fn register_raw(server: &TestServer) -> String {

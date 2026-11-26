@@ -75,6 +75,8 @@ pub async fn register(
     let token = token()?;
     let hash = token_hash(&token);
     let now = unix_time()?;
+    let is_new_device;
+    {
     let connection = state.db.0.lock().await;
     let transaction = connection.unchecked_transaction()?;
     let existing: Option<Vec<u8>> = transaction
@@ -84,6 +86,7 @@ pub async fn register(
             |row| row.get(0),
         )
         .optional()?;
+    is_new_device = existing.is_none();
     if existing.is_some_and(|old| old != ik) {
         return Err(ApiError::conflict(
             "device_id is registered with a different public key",
@@ -109,10 +112,69 @@ pub async fn register(
         )?;
     }
     transaction.commit()?;
+    }
+    if is_new_device {
+        // Every sync carries the directory epoch; clients refresh their device
+        // list as soon as it moves. This also reaches devices that were offline
+        // during the registration.
+        let connection = state.db.0.lock().await;
+        let _ = crate::db::bump_directory_epoch(&connection);
+    }
     Ok(Json(TokenResponse {
         token,
         expires_at: 0,
     }))
+}
+
+/// Deletes the calling device and every server-side record it owns.
+///
+/// Peers are told through the mailbox so an offline peer still learns about the
+/// deletion when it reconnects, and clients drop the dead contact.
+pub async fn delete_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let device_id = bearer(&state, &headers).await?;
+    {
+        let connection = state.db.0.lock().await;
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM file_refs WHERE recipient = ?1 OR file_id IN (SELECT file_id FROM files WHERE owner = ?1)",
+            [&device_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM files_recipients WHERE device_id = ?1 OR file_id IN (SELECT file_id FROM files WHERE owner = ?1)",
+            [&device_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM file_chunks WHERE file_id IN (SELECT file_id FROM files WHERE owner = ?1)",
+            [&device_id],
+        )?;
+        transaction.execute("DELETE FROM files WHERE owner = ?1", [&device_id])?;
+        transaction.execute(
+            "DELETE FROM group_members WHERE device_id = ?1 OR group_id IN (SELECT group_id FROM groups WHERE owner = ?1)",
+            [&device_id],
+        )?;
+        transaction.execute("DELETE FROM groups WHERE owner = ?1", [&device_id])?;
+        transaction.execute(
+            "DELETE FROM mailboxes WHERE owner_id = ?1 OR from_id = ?1",
+            [&device_id],
+        )?;
+        transaction.execute("DELETE FROM owner_seq WHERE owner_id = ?1", [&device_id])?;
+        transaction.execute("DELETE FROM opk_pool WHERE owner_id = ?1", [&device_id])?;
+        transaction.execute("DELETE FROM devices WHERE device_id = ?1", [&device_id])?;
+        crate::db::bump_directory_epoch(&transaction)?;
+        transaction.commit()?;
+    }
+    // Peers drop the contact; the directory epoch (bumped above) drives the
+    // discovery list refresh, so no second notice is needed.
+    let _ = crate::api::mailbox::broadcast_notice(
+        &state,
+        serde_json::json!({"event": "device_deleted", "device_id": device_id}),
+        None,
+    )
+    .await;
+    Ok(Json(serde_json::json!({"deleted": true})))
 }
 
 fn validate_device_id(id: &str) -> Result<(), ApiError> {

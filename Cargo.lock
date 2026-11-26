@@ -1078,6 +1078,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "webpki-roots",
  "x25519-dalek",
 ]
 

@@ -476,3 +476,79 @@ async fn unacked_mail_survives_sigkill_and_restart() {
     assert_eq!(entries[0]["seq"], 1);
     assert_eq!(entries[1]["seq"], 2);
 }
+
+async fn sync_epoch(server: &Server, device: &Device) -> u64 {
+    server
+        .client
+        .get(format!("{}/api/v1/sync?since=0", server.base))
+        .bearer_auth(&device.token)
+        .send()
+        .await
+        .unwrap()
+        .headers()
+        .get("x-kite-directory-epoch")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn directory_epoch_moves_when_a_device_registers() {
+    let server = spawn_server().await;
+    let a = register(&server, "Alice").await;
+    let before = sync_epoch(&server, &a).await;
+    let b = register(&server, "Bob").await;
+    let after = sync_epoch(&server, &a).await;
+    assert!(
+        after > before,
+        "registering a device must advance the directory epoch ({before} -> {after})"
+    );
+    assert!(sync_epoch(&server, &b).await >= after);
+}
+
+#[tokio::test]
+async fn deleting_an_account_removes_its_data_and_notifies_peers() {
+    let server = spawn_server().await;
+    let a = register(&server, "Alice").await;
+    let b = register(&server, "Bob").await;
+    let epoch_before = sync_epoch(&server, &b).await;
+    let (status, _) = send(&server, &a, &b.id, "msg", b"hello", now()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let response = server
+        .client
+        .delete(format!("{}/api/v1/account", server.base))
+        .bearer_auth(&a.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The deleted token no longer authenticates.
+    let response = server
+        .client
+        .get(format!("{}/api/v1/devices", server.base))
+        .bearer_auth(&a.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // The peer sees a durable notice and the deleted device's messages are gone.
+    assert!(sync_epoch(&server, &b).await > epoch_before);
+    let entries = sync(&server, &b, 0).await;
+    assert!(
+        entries.iter().all(|entry| entry["kind"] != "msg"),
+        "messages authored by a deleted account must be removed: {entries:?}"
+    );
+    let deletion = entries
+        .iter()
+        .find(|entry| entry["kind"] == "notice")
+        .expect("device_deleted notice");
+    let payload = B64
+        .decode(deletion["payload"].as_str().unwrap())
+        .unwrap();
+    let body: Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(body["event"], "device_deleted");
+    assert_eq!(body["device_id"], a.id);
+}

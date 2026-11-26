@@ -10,6 +10,17 @@
 - Windows 打包：`nsis`（Linux 版 makensis 即可）
 - Linux 打包：Tauri 自带 AppImage 打包（需要网络；也可用 appimagetool 手工打包）
 
+## 0. 图标
+
+所有平台共用仓库根目录的 `icon.png`：
+
+```bash
+cd apps/desktop
+npx tauri icon ../../icon.png   # 桌面、Android、iOS 图标一次性生成
+```
+
+Android 自适应图标的背景色在 `gen/android/.../values/ic_launcher_background.xml`，应与 `icon.png` 边缘颜色一致。
+
 ## 1. 服务端
 
 ```bash
@@ -31,6 +42,17 @@ cargo xwin build --release -p kite-server --target aarch64-pc-windows-msvc
 ```
 
 打包：每个平台一个压缩包，内含 `kite-server`(`.exe`) 与 `README.txt`。
+
+### glibc 兼容性
+
+开发机的 glibc 往往比部署机新。发布给旧系统（如 Ubuntu 22.04 / glibc 2.35）的服务端必须在旧环境中构建：
+
+```bash
+./scripts/build_server_glibc.sh    # Docker + ubuntu:22.04，产出 target/glibc-22.04/
+objdump -T target/glibc-22.04/kite-server-linux-x64 | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1
+```
+
+脚本同时交叉编译 `arm64`，并打印两个产物所需的最高 GLIBC 版本。
 
 ## 2. Linux 桌面端
 

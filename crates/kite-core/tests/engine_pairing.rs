@@ -355,3 +355,82 @@ async fn consumed_opk_is_rejected_instead_of_downgrading_to_3dh() {
         "a named unavailable OPK must not create a 3DH session"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unpair_notifies_the_peer_and_drops_the_session() {
+    let server = TestServer::spawn();
+    let temp = tempfile::tempdir().unwrap();
+    let mut alice = engine(&temp, "alice", &server);
+    let mut bob = engine(&temp, "bob", &server);
+    alice.register("Alice", "a").await.unwrap();
+    bob.register("Bob", "b").await.unwrap();
+    let alice_id = alice.device_id().to_owned();
+    let bob_id = bob.device_id().to_owned();
+    alice.start_pairing(&bob_id).await.unwrap();
+    assert!(matches!(
+        bob.poll_once().await.unwrap().as_slice(),
+        [InboxEvent::PairRequest { .. }]
+    ));
+    bob.confirm_pairing(&alice_id).await.unwrap();
+    alice.poll_once().await.unwrap();
+
+    alice.unpair(&bob_id).await.unwrap();
+    assert!(alice.paired_peers().unwrap().is_empty());
+    assert!(alice.send_message(&bob_id, "gone").await.is_err());
+
+    let events = bob.poll_once().await.unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, InboxEvent::PeerRemoved { peer } if peer == &alice_id)
+        ),
+        "peer must be told about the removal: {events:?}"
+    );
+    assert!(bob.paired_peers().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_an_account_removes_the_contact_on_peers() {
+    let server = TestServer::spawn();
+    let temp = tempfile::tempdir().unwrap();
+    let mut alice = engine(&temp, "alice", &server);
+    let mut bob = engine(&temp, "bob", &server);
+    alice.register("Alice", "a").await.unwrap();
+    bob.register("Bob", "b").await.unwrap();
+    let alice_id = alice.device_id().to_owned();
+    let bob_id = bob.device_id().to_owned();
+    alice.start_pairing(&bob_id).await.unwrap();
+    bob.poll_once().await.unwrap();
+    bob.confirm_pairing(&alice_id).await.unwrap();
+    alice.poll_once().await.unwrap();
+
+    alice.delete_account().await.unwrap();
+    let events = bob.poll_once().await.unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, InboxEvent::PeerDeleted { peer } if peer == &alice_id)
+        ),
+        "peers must learn about the deleted account: {events:?}"
+    );
+    assert!(bob.paired_peers().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_epoch_signals_new_registrations() {
+    let server = TestServer::spawn();
+    let temp = tempfile::tempdir().unwrap();
+    let mut alice = engine(&temp, "alice", &server);
+    alice.register("Alice", "a").await.unwrap();
+    alice.poll_once().await.unwrap();
+    let _ = alice.take_directory_changed();
+
+    let mut bob = engine(&temp, "bob", &server);
+    bob.register("Bob", "b").await.unwrap();
+
+    alice.poll_once().await.unwrap();
+    assert!(
+        alice.take_directory_changed(),
+        "a new registration must trigger a directory refresh"
+    );
+    alice.poll_once().await.unwrap();
+    assert!(!alice.take_directory_changed());
+}

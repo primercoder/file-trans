@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use tokio::sync::Mutex;
 
 /// A single SQLite connection shared by handlers; WAL permits concurrent readers.
@@ -98,6 +98,9 @@ impl Db {
                  device_id TEXT NOT NULL,
                  role TEXT NOT NULL,
                  PRIMARY KEY(group_id, device_id)
+             );
+             CREATE TABLE IF NOT EXISTS meta(
+                 key TEXT PRIMARY KEY, value TEXT NOT NULL
              );",
         )?;
         // M5: group fan-out keeps the group id as routing metadata (payload stays ciphertext).
@@ -142,6 +145,28 @@ impl Db {
         }
         Ok(Self(Mutex::new(connection), data_dir))
     }
+}
+
+/// Monotonic counter of directory changes (registrations and deletions).
+///
+/// Every sync response carries it, which lets clients refresh their device list
+/// without polling a separate endpoint and without missing changes while offline.
+pub fn directory_epoch(connection: &Connection) -> Result<u64, rusqlite::Error> {
+    let value: Option<String> = connection
+        .query_row("SELECT value FROM meta WHERE key='directory_epoch'", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(value.and_then(|value| value.parse().ok()).unwrap_or(0))
+}
+
+pub fn bump_directory_epoch(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "INSERT INTO meta(key,value) VALUES('directory_epoch','1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+        [],
+    )?;
+    Ok(())
 }
 
 fn backfill_actual_bytes(

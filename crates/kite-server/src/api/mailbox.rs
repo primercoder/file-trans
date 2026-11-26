@@ -18,6 +18,41 @@ use crate::{
 
 pub const MAX_PAYLOAD: usize = 256 * 1024;
 
+/// Server-authored notice kinds are delivered through the same durable mailbox
+/// as peer messages, so an offline client still learns about directory changes
+/// and account deletions when it comes back.
+pub async fn broadcast_notice(
+    state: &AppState,
+    body: serde_json::Value,
+    except: Option<&str>,
+) -> Result<(), ApiError> {
+    let payload = B64.encode(
+        serde_json::to_vec(&body).map_err(|error| ApiError::invalid(error.to_string()))?,
+    );
+    let recipients: Vec<String> = {
+        let connection = state.db.0.lock().await;
+        let mut statement = connection.prepare("SELECT device_id FROM devices")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|row| row.ok())
+            .filter(|id| Some(id.as_str()) != except)
+            .collect()
+    };
+    for recipient in recipients {
+        let _ = enqueue(
+            state,
+            "server".to_owned(),
+            recipient,
+            "notice".to_owned(),
+            &payload,
+            unix_time()?,
+            None,
+            None,
+        )
+        .await;
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct SendRequest {
     pub to: String,
@@ -188,7 +223,7 @@ pub async fn sync(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<SyncQuery>,
-) -> Result<Json<Vec<Entry>>, ApiError> {
+) -> Result<(HeaderMap, Json<Vec<Entry>>), ApiError> {
     let owner = bearer(&state, &headers).await?;
     let notification = notifier(&state, &owner).await;
     let notified = notification.notified();
@@ -200,7 +235,15 @@ pub async fn sync(
         let _ = tokio::time::timeout(Duration::from_secs(25), notified).await;
         entries = read_entries(&state, &owner, query.since).await?;
     }
-    Ok(Json(entries))
+    let epoch = {
+        let connection = state.db.0.lock().await;
+        crate::db::directory_epoch(&connection).unwrap_or(0)
+    };
+    let mut response_headers = HeaderMap::new();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&epoch.to_string()) {
+        response_headers.insert("x-kite-directory-epoch", value);
+    }
+    Ok((response_headers, Json(entries)))
 }
 
 async fn read_entries(state: &AppState, owner: &str, since: i64) -> Result<Vec<Entry>, ApiError> {

@@ -2352,6 +2352,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+ "webpki-roots",
  "x25519-dalek",
 ]
 
@@ -2360,9 +2361,11 @@ name = "kite-desktop"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "hex",
  "kite-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

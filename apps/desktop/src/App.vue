@@ -1,199 +1,354 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { api, formatSize, shortId } from "./api";
-import type { ChatView, DeviceInfo, GroupDto, Peer, PeerSecurity, Status } from "./types";
+import { api, groupSafety, shortId } from "./api";
+import { translate } from "./i18n";
+import type { AccountView, ChatView, DeviceInfo, GroupDto, Peer, Status } from "./types";
 import Onboarding from "./components/Onboarding.vue";
 import MessageItem from "./components/MessageItem.vue";
-import SettingsPanel from "./components/SettingsPanel.vue";
+import SettingsSheet from "./components/SettingsSheet.vue";
+import AddContact from "./components/AddContact.vue";
+
+type Locale = "zh" | "en";
 
 const status = ref<Status | null>(null);
+const accounts = ref<AccountView[]>([]);
 const peers = ref<Peer[]>([]);
 const devices = ref<DeviceInfo[]>([]);
 const groups = ref<GroupDto[]>([]);
-const activePeer = ref<string | null>(null);
 const messages = ref<ChatView[]>([]);
+const activeId = ref<string | null>(null);
+const pending = ref<{ peer: string; name: string }[]>([]);
 const input = ref("");
 const busy = ref(false);
+const sendingFile = ref(false);
+const downloading = ref<string | null>(null);
 const toast = ref("");
+const fatal = ref("");
 const showSettings = ref(false);
-const dragOver = ref(false);
-const isMobile = ref(false);
-const showCreateGroup = ref(false);
+const showAdd = ref(false);
+const showOnboarding = ref(false);
+const onboardingServer = ref("");
+const showGroup = ref(false);
 const groupName = ref("");
 const groupMembers = ref<string[]>([]);
-const manualPeer = ref("");
-const security = ref<PeerSecurity | null>(null);
-const securityTarget = ref<string | null>(null);
-let timer: number | undefined;
+const security = ref<{ peer: string; code: string | null } | null>(null);
+const confirming = ref<{ peer: string; name: string } | null>(null);
+const isMobile = ref(false);
+const dragOver = ref(false);
+const scroller = ref<HTMLElement | null>(null);
+const fileInput = ref<HTMLInputElement | null>(null);
 
-const deviceNames = computed(() => {
-  const map: Record<string, string> = {};
-  for (const device of devices.value) map[device.device_id] = device.name;
+let timer: number | undefined;
+let polling = false;
+let pollFailures = 0;
+let lastToastAt = 0;
+
+const locale = computed<Locale>(() => (status.value?.locale === "en" ? "en" : "zh"));
+const t = (key: string, vars?: Record<string, string | number>) => translate(locale.value, key, vars);
+
+const deviceMap = computed(() => {
+  const map: Record<string, DeviceInfo> = {};
+  for (const device of devices.value) map[device.device_id] = device;
   return map;
 });
 
-const pairedIds = computed(() => new Set(peers.value.map((peer) => peer.deviceId)));
-const discoverable = computed(() =>
-  devices.value.filter((device) => !pairedIds.value.has(device.device_id) && device.device_id !== status.value?.deviceId),
+const activeGroup = computed(() => groups.value.find((group) => group.group_id === activeId.value) ?? null);
+const activePeer = computed(() => {
+  if (!activeId.value || activeGroup.value) return null;
+  return peers.value.find((peer) => peer.deviceId === activeId.value) ?? null;
+});
+
+function peerName(id: string): string {
+  return deviceMap.value[id]?.name || shortId(id);
+}
+
+const contactRows = computed(() =>
+  peers.value
+    .filter((peer) => peer.status !== "pending_accept")
+    .map((peer) => {
+    const device = deviceMap.value[peer.deviceId];
+    const paired = peer.status === "paired";
+    return {
+      id: peer.deviceId,
+      title: peerName(peer.deviceId),
+      subtitle: paired
+        ? device?.online
+          ? t("list.online")
+          : t("list.offline")
+        : t("pair.waiting"),
+      badge: paired ? t("list.friend") : t("list.pending"),
+      online: Boolean(device?.online && paired),
+    };
+  }),
 );
-const activeGroup = computed(() =>
-  groups.value.find((group) => group.group_id === activePeer.value) ?? null,
+
+const pairedContacts = computed(() => contactRows.value.filter((row) => peers.value.find((peer) => peer.deviceId === row.id)?.status === "paired"));
+
+const groupRows = computed(() =>
+  groups.value.map((group) => ({
+    id: group.group_id,
+    title: group.name,
+    subtitle: t("list.members", { n: group.members.length }),
+    badge: t("list.group"),
+    online: false,
+  })),
 );
-const activePeerName = computed(() => {
-  if (!activePeer.value) return "";
+
+const rows = computed(() => [...contactRows.value, ...groupRows.value]);
+const isEmpty = computed(() => !pending.value.length && !rows.value.length);
+
+const activeTitle = computed(() => {
   if (activeGroup.value) return activeGroup.value.name;
-  return deviceNames.value[activePeer.value] || `设备 ${shortId(activePeer.value)}`;
+  if (activeId.value) return peerName(activeId.value);
+  return "";
 });
-const pendingRequests = computed(() =>
-  messages.value.filter((message) => message.kind === "pair_request"),
-);
-const pendingForActive = computed(() => {
-  if (!activePeer.value) return null;
-  return pendingRequests.value.find((request) => request.peer === activePeer.value) ?? null;
+
+const activeSubtitle = computed(() => {
+  if (activeGroup.value) return t("list.members", { n: activeGroup.value.members.length });
+  if (!activePeer.value) return "";
+  if (activePeer.value.status !== "paired") return t("pair.waiting");
+  return deviceMap.value[activePeer.value.deviceId]?.online ? t("list.online") : t("list.offline");
 });
+
+function reload() {
+  window.location.reload();
+}
 
 function showToast(message: string) {
   toast.value = message;
   window.setTimeout(() => {
     if (toast.value === message) toast.value = "";
-  }, 3600);
+  }, 3200);
 }
 
-async function refreshStatus() {
-  status.value = await api.status();
-  if (status.value.registered) {
-    await refreshLists();
-    await poll();
+function applyTheme() {
+  const preference = status.value?.theme ?? "system";
+  const resolved =
+    preference === "system"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light"
+      : preference;
+  document.documentElement.dataset.theme = resolved;
+}
+
+async function bootstrap() {
+  try {
+    status.value = await api.status();
+  } catch (error) {
+    fatal.value = String(error);
+    return;
   }
+  applyTheme();
+  if (!status.value.configured || !status.value.registered) {
+    showOnboarding.value = true;
+    return;
+  }
+  accounts.value = await api.accounts().catch(() => []);
+  await refreshLists();
+  startPolling();
+}
+
+async function afterAuth(next: Status) {
+  status.value = next;
+  showOnboarding.value = false;
+  onboardingServer.value = "";
+  applyTheme();
+  accounts.value = await api.accounts().catch(() => []);
+  pending.value = [];
+  activeId.value = null;
+  messages.value = [];
+  await refreshLists();
+  startPolling();
 }
 
 async function refreshLists() {
-  try {
-    peers.value = await api.listPeers();
-    groups.value = await api.listGroups().catch(() => []);
-    const deviceList = await api.listDevices();
-    devices.value = deviceList;
-    if (!activePeer.value) {
-      const first = deviceList.find((device) => pairedIds.value.has(device.device_id));
-      if (first) await selectPeer(first.device_id);
+  if (!status.value?.registered) return;
+  const [peersResult, groupsResult, devicesResult] = await Promise.allSettled([
+    api.listPeers(),
+    api.listGroups(),
+    api.listDevices(),
+  ]);
+  if (peersResult.status === "fulfilled") peers.value = peersResult.value;
+  if (groupsResult.status === "fulfilled") groups.value = groupsResult.value;
+  if (devicesResult.status === "fulfilled") devices.value = devicesResult.value;
+  for (const peer of peers.value) {
+    if (
+      peer.status === "pending_accept" &&
+      !pending.value.some((request) => request.peer === peer.deviceId)
+    ) {
+      pending.value.push({ peer: peer.deviceId, name: peerName(peer.deviceId) });
     }
+  }
+  if (activeId.value && !rows.value.some((row) => row.id === activeId.value)) {
+    activeId.value = null;
+    messages.value = [];
+  }
+  if (!activeId.value && rows.value.length && !isMobile.value) {
+    await select(rows.value[0].id);
+  }
+}
+
+async function select(id: string) {
+  activeId.value = id;
+  try {
+    messages.value = await api.history(id);
   } catch (error) {
+    messages.value = [];
     showToast(String(error));
   }
+  await scrollToBottom();
+}
+
+async function scrollToBottom() {
+  await nextTick();
+  if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight;
+}
+
+function startPolling() {
+  if (timer) window.clearInterval(timer);
+  pollFailures = 0;
+  timer = window.setInterval(() => void poll(), 2000);
+  void poll();
 }
 
 async function poll() {
-  if (!status.value?.registered) return;
+  if (polling || !status.value?.registered) return;
+  polling = true;
   try {
-    const events = await api.poll();
-    for (const event of events) {
-      if (event.kind === "pair_request" && event.peer && !activePeer.value) {
-        activePeer.value = event.peer;
+    const result = await api.poll();
+    pollFailures = 0;
+    let dirty = result.devicesChanged;
+    for (const message of result.messages) {
+      if (message.kind === "pair_request") {
+        if (!pending.value.some((request) => request.peer === message.peer)) {
+          pending.value.push({ peer: message.peer, name: message.text || shortId(message.peer) });
+        }
+        dirty = true;
+        continue;
       }
-      if (event.peer === activePeer.value || event.kind === "pair_request") {
-        messages.value.push(event);
+      if (message.kind === "peer_removed" || message.kind === "peer_deleted") {
+        pending.value = pending.value.filter((request) => request.peer !== message.peer);
+        dirty = true;
+        if (activeId.value === message.peer) {
+          await select(message.peer);
+        }
+        continue;
+      }
+      if (message.peer === activeId.value) {
+        messages.value.push(message);
+      }
+      if (message.kind === "pair_ok" || message.kind === "pair_rejected" || message.kind === "group_ready") {
+        dirty = true;
       }
     }
-    if (events.length) {
-      peers.value = await api.listPeers();
-      devices.value = await api.listDevices();
+    if (dirty) await refreshLists();
+    if (messages.value.length) await scrollToBottom();
+  } catch (error) {
+    pollFailures += 1;
+    const nowMs = Date.now();
+    if (pollFailures >= 3 && nowMs - lastToastAt > 15000) {
+      lastToastAt = nowMs;
+      showToast(`${t("error.network")}: ${String(error)}`);
     }
-  } catch (error) {
-    // transient network failures are expected while the server restarts
-    console.warn(error);
+  } finally {
+    polling = false;
   }
 }
 
-async function selectPeer(peer: string) {
-  activePeer.value = peer;
-  messages.value = await api.history(peer);
-}
-
-async function requestPair(deviceId: string) {
-  const peer = deviceId.trim().toLowerCase();
-  if (!/^[0-9a-f]{32}$/.test(peer)) {
-    showToast("设备 ID 必须是 32 位十六进制字符");
-    return;
-  }
-  try {
-    await api.pair(peer);
-    manualPeer.value = "";
-    showToast("配对请求已发送，等待对方确认");
-    await refreshLists();
-  } catch (error) {
-    showToast(String(error));
-  }
-}
-
-/// Opens the out-of-band identity check for a peer (paired or pending).
-async function openSecurity(peer: string) {
-  securityTarget.value = peer;
-  security.value = null;
-  try {
-    security.value = await api.peerSecurity(peer);
-  } catch (error) {
-    showToast(String(error));
-    securityTarget.value = null;
-  }
-}
-
-const formattedSafety = computed(() => {
-  const code = security.value?.safetyNumber;
-  if (!code) return "";
-  return (code.match(/.{5}/g) || [code]).join(" ");
-});
-
-async function copySafety() {
-  const code = formattedSafety.value;
-  if (!code) return;
-  try {
-    await navigator.clipboard.writeText(code);
-    showToast("安全码已复制，请通过其他渠道与对方核对");
-  } catch {
-    showToast("复制失败，请手动核对");
-  }
-}
-
-async function acceptPair(peer: string) {
+async function accept(peer: string) {
+  if (busy.value) return;
+  busy.value = true;
   try {
     await api.confirmPair(peer);
-    showToast("已接受配对");
-    messages.value = messages.value.filter(
-      (message) => !(message.kind === "pair_request" && message.peer === peer),
-    );
+    pending.value = pending.value.filter((request) => request.peer !== peer);
+    await refreshLists();
+    await select(peer);
+    showToast(t("pair.accepted"));
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function reject(peer: string) {
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    await api.rejectPair(peer);
+    pending.value = pending.value.filter((request) => request.peer !== peer);
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function requestPair(peer: string) {
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    await api.pair(peer);
+    showToast(t("pair.sent"));
+    showAdd.value = false;
+    await refreshLists();
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function removeContact() {
+  const peer = activePeer.value;
+  if (!peer) return;
+  confirming.value = null;
+  try {
+    await api.unpair(peer.deviceId);
+    activeId.value = null;
+    messages.value = [];
     await refreshLists();
   } catch (error) {
     showToast(String(error));
   }
 }
 
-async function rejectPair(peer: string) {
+async function openSecurity(peer: string) {
   try {
-    await api.rejectPair(peer);
-    messages.value = messages.value.filter(
-      (message) => !(message.kind === "pair_request" && message.peer === peer),
-    );
-    showToast("已拒绝配对");
+    const info = await api.peerSecurity(peer);
+    security.value = { peer, code: info.safetyNumber };
   } catch (error) {
     showToast(String(error));
+  }
+}
+
+async function copySafety() {
+  if (!security.value?.code) return;
+  try {
+    await navigator.clipboard.writeText(groupSafety(security.value.code));
+    showToast(t("common.copied"));
+  } catch {
+    showToast(groupSafety(security.value.code));
   }
 }
 
 async function send() {
   const text = input.value.trim();
-  if (!text || !activePeer.value) return;
+  if (!text || !activeId.value || busy.value) return;
   busy.value = true;
   try {
     if (activeGroup.value) {
-      await api.sendGroupMessage(activePeer.value, text);
+      await api.sendGroupMessage(activeId.value, text);
     } else {
-      await api.sendMessage(activePeer.value, text);
+      await api.sendMessage(activeId.value, text);
     }
     input.value = "";
-    messages.value = await api.history(activePeer.value);
+    messages.value = await api.history(activeId.value);
+    await scrollToBottom();
   } catch (error) {
     showToast(String(error));
   } finally {
@@ -202,18 +357,94 @@ async function send() {
 }
 
 async function attach() {
-  if (!activePeer.value) return;
-  const picked = await open({ multiple: false, title: "选择要发送的文件" });
-  if (typeof picked === "string") await sendPath(picked);
+  if (!activeId.value || sendingFile.value) return;
+  if (activeGroup.value) {
+    showToast(t("chat.attach"));
+    return;
+  }
+  // Android's system picker returns content:// URIs; the WebView input path
+  // works on every platform and lets us read the bytes directly.
+  if (isMobile.value || !("__TAURI_INTERNALS__" in window)) {
+    fileInput.value?.click();
+    return;
+  }
+  try {
+    const path = await open({ multiple: false, directory: false });
+    if (typeof path === "string") await sendPath(path);
+  } catch (error) {
+    showToast(String(error));
+  }
+}
+
+function readFileBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      resolve(result.slice(result.indexOf(",") + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function onFilePicked(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file || !activeId.value || activeGroup.value) return;
+  sendingFile.value = true;
+  showToast(t("chat.sendingFile"));
+  try {
+    const data = await readFileBase64(file);
+    await api.sendFileData(activeId.value, file.name, data);
+    messages.value = await api.history(activeId.value);
+    await scrollToBottom();
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    sendingFile.value = false;
+  }
 }
 
 async function sendPath(path: string) {
-  if (!activePeer.value) return;
+  if (!activeId.value || activeGroup.value) return;
+  sendingFile.value = true;
+  showToast(t("chat.sendingFile"));
+  try {
+    await api.sendFile(activeId.value, path);
+    messages.value = await api.history(activeId.value);
+    await scrollToBottom();
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    sendingFile.value = false;
+  }
+}
+
+async function download(fileId: string) {
+  if (downloading.value) return;
+  downloading.value = fileId;
+  try {
+    const saved = await api.downloadFile(fileId);
+    showToast(t("chat.saved", { path: saved }));
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    downloading.value = null;
+  }
+}
+
+async function submitGroup() {
+  const name = groupName.value.trim();
+  if (!name || busy.value) return;
   busy.value = true;
   try {
-    await api.sendFile(activePeer.value, path);
-    messages.value = await api.history(activePeer.value);
-    showToast("文件已发送");
+    await api.createGroup(name, groupMembers.value);
+    showGroup.value = false;
+    groupName.value = "";
+    groupMembers.value = [];
+    await refreshLists();
   } catch (error) {
     showToast(String(error));
   } finally {
@@ -221,268 +452,310 @@ async function sendPath(path: string) {
   }
 }
 
-function toggleGroupMember(id: string) {
-  if (groupMembers.value.includes(id)) {
-    groupMembers.value = groupMembers.value.filter((member) => member !== id);
-  } else {
-    groupMembers.value = [...groupMembers.value, id];
-  }
+function toggleMember(id: string) {
+  groupMembers.value = groupMembers.value.includes(id)
+    ? groupMembers.value.filter((member) => member !== id)
+    : [...groupMembers.value, id];
 }
 
-async function submitGroup() {
-  if (!groupName.value.trim() || !groupMembers.value.length) {
-    showToast("请填写群组名称并选择成员");
+async function onPreferences(next: Status) {
+  status.value = next;
+  applyTheme();
+  accounts.value = await api.accounts().catch(() => []);
+  if (!next.configured || !next.registered) {
+    showSettings.value = false;
+    showOnboarding.value = true;
     return;
   }
-  try {
-    const group = await api.createGroup(groupName.value.trim(), groupMembers.value);
-    groups.value = [group, ...groups.value];
-    showCreateGroup.value = false;
-    groupName.value = "";
-    groupMembers.value = [];
-    await selectPeer(group.group_id);
-    showToast("群组已创建，密钥已分发");
-  } catch (error) {
-    showToast(String(error));
-  }
+  pending.value = [];
+  activeId.value = null;
+  messages.value = [];
+  await refreshLists();
 }
 
-async function download(fileId: string) {
-  try {
-    const path = await api.downloadFile(fileId);
-    showToast(`已保存到 ${path}`);
-  } catch (error) {
-    showToast(String(error));
-  }
+async function onOnboardingReady(next: Status) {
+  await afterAuth(next);
 }
 
-function handleReady(next: Status) {
-  status.value = next;
-  refreshLists();
-  poll();
+function openAddAccount() {
+  showSettings.value = false;
+  onboardingServer.value = status.value?.serverUrl || "https://";
+  showOnboarding.value = true;
 }
 
 onMounted(async () => {
-  const media = window.matchMedia("(max-width: 720px)");
-  isMobile.value = media.matches;
-  media.addEventListener("change", (event) => (isMobile.value = event.matches));
+  isMobile.value = window.matchMedia("(max-width: 760px)").matches;
+  window.matchMedia("(max-width: 760px)").addEventListener("change", (event) => {
+    isMobile.value = event.matches;
+  });
+  window.addEventListener("error", (event) => {
+    if (!fatal.value) fatal.value = event.message || String(event.error);
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    if (!fatal.value) fatal.value = String(event.reason);
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") void poll();
+  });
+  window
+    .matchMedia("(prefers-color-scheme: dark)")
+    .addEventListener("change", () => status.value?.theme === "system" && applyTheme());
+
   try {
     if (!(await isPermissionGranted())) await requestPermission();
-  } catch (error) {
-    console.warn("notification permission unavailable", error);
+  } catch {
+    // notifications are optional (desktop without a daemon, Android before 13)
   }
-  await refreshStatus();
-  timer = window.setInterval(poll, 2000);
+
   try {
     await getCurrentWebview().onDragDropEvent(async (event) => {
       if (event.payload.type === "over") dragOver.value = true;
+      if (event.payload.type === "leave") dragOver.value = false;
       if (event.payload.type === "drop") {
         dragOver.value = false;
         const paths = event.payload.paths;
-        if (paths.length && activePeer.value) await sendPath(paths[0]);
+        if (paths.length) await sendPath(paths[0]);
       }
-      if (event.payload.type === "leave") dragOver.value = false;
     });
-  } catch (error) {
-    console.warn("drag-drop unavailable", error);
+  } catch {
+    // drag & drop is desktop-only
   }
+
+  await bootstrap();
 });
 
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer);
 });
 
-watch(activePeer, (peer) => {
-  if (peer) selectPeer(peer);
-});
 </script>
 
 <template>
-  <div v-if="!status" class="loading">正在启动…</div>
-  <Onboarding v-else-if="!status.registered" @ready="handleReady" @error="showToast" />
-  <div v-else class="shell" :class="{ 'show-sidebar': isMobile && !activePeer, mobile: isMobile }">
+  <div v-if="fatal" class="fatal">
+    <h2>{{ t("error.prefix") }}</h2>
+    <pre>{{ fatal }}</pre>
+    <button class="primary" @click="reload">{{ t("error.reload") }}</button>
+  </div>
+  <div v-else-if="!status" class="splash">{{ t("common.loading") }}</div>
+  <Onboarding
+    v-else-if="showOnboarding"
+    :locale="locale"
+    :initial-server="onboardingServer"
+    :can-cancel="accounts.length > 0"
+    @ready="onOnboardingReady"
+    @cancel="showOnboarding = false"
+    @error="showToast"
+  />
+  <div v-else class="app" :class="{ mobile: isMobile, 'chat-open': Boolean(activeId) }">
     <aside class="sidebar">
-      <div class="brand">
-        <img src="/kite-icon.png" alt="" class="brand-icon" />
-        <div>
-          <strong>Kite</strong>
+      <header class="brand">
+        <img src="/kite-icon.png" alt="" class="brand-logo" />
+        <div class="brand-text">
+          <strong>{{ t("app.name") }}</strong>
           <span class="muted small">{{ status.name }} · {{ shortId(status.deviceId || "") }}</span>
         </div>
-        <button class="icon" title="设置" @click="showSettings = true">⚙</button>
+        <button class="icon" :title="t('nav.settings')" @click="showSettings = true">⚙</button>
+      </header>
+
+      <div class="list-head">
+        <h2>{{ t("nav.contacts") }}</h2>
+        <div class="list-actions">
+          <button class="icon" :title="t('group.create')" @click="showGroup = true">群</button>
+          <button class="icon" :title="t('nav.add')" @click="showAdd = true">＋</button>
+        </div>
       </div>
 
-      <div class="section-title">会话</div>
-      <div v-if="!peers.length" class="muted small pad">还没有配对设备</div>
-      <button
-        v-for="peer in peers"
-        :key="peer.deviceId"
-        class="peer"
-        :class="{ active: peer.deviceId === activePeer }"
-        @click="selectPeer(peer.deviceId)"
-      >
-        <span class="avatar">{{ (deviceNames[peer.deviceId] || "?").slice(0, 1) }}</span>
-        <span class="peer-info">
-          <strong>{{ deviceNames[peer.deviceId] || `设备 ${shortId(peer.deviceId)}` }}</strong>
-          <span class="muted small">{{ peer.status === "paired" ? "已配对" : "待确认" }}</span>
-        </span>
-      </button>
+      <div class="list">
+        <div v-for="request in pending" :key="`req-${request.peer}`" class="request-card">
+          <div>
+            <strong>{{ request.name }}</strong>
+            <span class="muted small">{{ t("pair.incoming", { name: shortId(request.peer) }) }}</span>
+          </div>
+          <div class="request-actions">
+            <button class="small" :disabled="busy" @click="reject(request.peer)">
+              {{ t("pair.reject") }}
+            </button>
+            <button class="primary small" :disabled="busy" @click="accept(request.peer)">
+              {{ t("pair.accept") }}
+            </button>
+          </div>
+        </div>
 
-      <div class="section-title">
-        <span>群组</span>
-        <button class="tiny" @click="showCreateGroup = true">＋</button>
-      </div>
-      <div v-if="!groups.length" class="muted small pad">还没有群组</div>
-      <button
-        v-for="group in groups"
-        :key="group.group_id"
-        class="peer"
-        :class="{ active: group.group_id === activePeer }"
-        @click="selectPeer(group.group_id)"
-      >
-        <span class="avatar group">{{ group.name.slice(0, 1) }}</span>
-        <span class="peer-info">
-          <strong>{{ group.name }}</strong>
-          <span class="muted small">{{ group.members.length }} 位成员</span>
-        </span>
-      </button>
-
-      <div class="section-title">按设备 ID 配对</div>
-      <div class="manual-pair">
-        <input
-          v-model="manualPeer"
-          placeholder="对方设备 ID（32 位）"
-          spellcheck="false"
-          @keydown.enter="requestPair(manualPeer)"
-        />
-        <button class="small" :disabled="!manualPeer.trim()" @click="requestPair(manualPeer)">
-          配对
+        <button
+          v-for="row in rows"
+          :key="row.id"
+          class="contact"
+          :class="{ active: row.id === activeId }"
+          @click="select(row.id)"
+        >
+          <span class="avatar" :class="{ group: groupRows.some((group) => group.id === row.id) }">
+            {{ row.title.slice(0, 1).toUpperCase() }}
+          </span>
+          <span class="contact-meta">
+            <strong>{{ row.title }}</strong>
+            <span class="muted small">
+              <span v-if="row.online" class="dot" />
+              {{ row.subtitle }}
+            </span>
+          </span>
+          <span class="badge">{{ row.badge }}</span>
         </button>
-      </div>
-      <p class="muted small pad">设备 ID 是对方身份公钥的指纹，可线下交换，不必依赖服务器目录。</p>
 
-      <div class="section-title">发现设备</div>
-      <div v-if="!discoverable.length" class="muted small pad">暂无其他设备</div>
-      <div v-for="device in discoverable" :key="device.device_id" class="peer">
-        <span class="avatar">{{ device.name.slice(0, 1) }}</span>
-        <span class="peer-info">
-          <strong>{{ device.name }}</strong>
-          <span class="muted small">{{ shortId(device.device_id) }} · {{ device.online ? "在线" : "离线" }}</span>
-        </span>
-        <button class="small" @click="requestPair(device.device_id)">配对</button>
+        <div v-if="isEmpty" class="list-empty">
+          <p>{{ t("list.empty") }}</p>
+          <p class="muted small">{{ t("list.emptyHint") }}</p>
+          <button class="primary small" @click="showAdd = true">{{ t("nav.add") }}</button>
+        </div>
       </div>
     </aside>
 
-    <main class="chat">
-      <template v-if="activePeer">
-        <header class="chat-header">
-          <button v-if="isMobile" class="icon back" @click="activePeer = null">←</button>
-          <div>
-            <strong>{{ activePeerName }}</strong>
-            <span class="muted small">{{ shortId(activePeer) }}</span>
-          </div>
-          <button
-            v-if="!activeGroup"
-            class="small ghost security"
-            title="核验对方身份的安全码"
-            @click="openSecurity(activePeer)"
-          >
-            安全码
-          </button>
-        </header>
-        <div class="messages">
-          <div v-if="pendingForActive" class="pair-banner">
-            <span>
-              对方请求与你配对
-              <br />
-              <span class="muted small">设备 {{ pendingForActive.peer }}</span>
-            </span>
-            <div>
-              <button class="small ghost" @click="openSecurity(pendingForActive.peer)">核验身份</button>
-              <button class="primary small" @click="acceptPair(pendingForActive.peer)">接受</button>
-              <button class="small" @click="rejectPair(pendingForActive.peer)">拒绝</button>
-            </div>
-          </div>
-          <div v-if="!messages.length" class="empty muted">开始发送第一条消息吧</div>
-          <MessageItem
-            v-for="(message, index) in messages"
-            :key="`${message.ts}-${index}`"
-            :message="message"
-            @download="download"
-          />
+    <main v-if="activeId" class="chat">
+      <header class="chat-head">
+        <button v-if="isMobile" class="icon" @click="activeId = null">←</button>
+        <div class="chat-title">
+          <strong>{{ activeTitle }}</strong>
+          <span class="muted small">{{ activeSubtitle }}</span>
         </div>
-        <footer class="composer">
-          <button class="icon attach" title="发送文件" :disabled="busy" @click="attach">📎</button>
-          <textarea
-            v-model="input"
-            rows="1"
-            placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-            @keydown.enter.exact.prevent="send"
-          ></textarea>
-          <button class="primary" :disabled="busy || !input.trim()" @click="send">发送</button>
-        </footer>
-      </template>
-      <div v-else class="empty-state">
-        <img src="/kite-icon.png" alt="" class="empty-logo" />
-        <h2>选择一个会话</h2>
-        <p class="muted">从左侧发现设备并配对，即可安全地发送消息与文件</p>
+        <div v-if="activePeer" class="chat-actions">
+          <button class="icon" :title="t('chat.safety')" @click="openSecurity(activePeer.deviceId)">◎</button>
+          <button
+            class="icon"
+            :title="t('chat.remove')"
+            @click="confirming = { peer: activePeer.deviceId, name: peerName(activePeer.deviceId) }"
+          >
+            ⌫
+          </button>
+        </div>
+      </header>
+
+      <div ref="scroller" class="messages">
+        <div v-if="!messages.length" class="chat-empty">{{ t("chat.empty") }}</div>
+        <MessageItem
+          v-for="(message, index) in messages"
+          :key="`${message.ts}-${index}`"
+          :locale="locale"
+          :message="message"
+          :downloading="downloading === message.fileId"
+          :group="Boolean(activeGroup)"
+          @download="download"
+        />
       </div>
+
+      <footer class="composer">
+        <button
+          class="icon attach"
+          :title="t('chat.attach')"
+          :disabled="sendingFile"
+          @click="attach"
+        >
+          ＋
+        </button>
+        <textarea
+          v-model="input"
+          rows="1"
+          :placeholder="t('chat.placeholder')"
+          @keydown.enter.exact.prevent="send"
+        />
+        <button class="primary" :disabled="busy || !input.trim()" @click="send">
+          {{ t("chat.send") }}
+        </button>
+      </footer>
     </main>
 
-    <div v-if="dragOver" class="drop-overlay">
-      <div>松开鼠标，将文件发送给 {{ activePeerName || "对方" }}</div>
+    <div v-else class="chat empty-state">
+      <img src="/kite-icon.png" alt="" class="empty-logo" />
+      <p class="muted">{{ t("list.emptyHint") }}</p>
     </div>
+
+    <input ref="fileInput" type="file" class="hidden-input" @change="onFilePicked" />
+    <div v-if="dragOver" class="drop-overlay">{{ t("chat.attach") }}</div>
     <div v-if="toast" class="toast">{{ toast }}</div>
-    <div v-if="showCreateGroup" class="modal-mask" @click.self="showCreateGroup = false">
-      <div class="modal">
-        <header>
-          <h2>创建群组</h2>
-          <button class="icon" @click="showCreateGroup = false">×</button>
-        </header>
-        <section>
-          <input v-model="groupName" placeholder="群组名称" />
-          <p class="muted small">选择已配对成员（群密钥将经各自的加密会话分发）</p>
-          <div v-if="!peers.length" class="muted small">还没有已配对设备</div>
-          <label v-for="peer in peers" :key="peer.deviceId" class="check-row">
-            <input
-              type="checkbox"
-              :checked="groupMembers.includes(peer.deviceId)"
-              @change="toggleGroupMember(peer.deviceId)"
-            />
-            <span>{{ deviceNames[peer.deviceId] || shortId(peer.deviceId) }}</span>
-          </label>
-          <button class="primary" @click="submitGroup">创建并分发密钥</button>
-        </section>
-      </div>
-    </div>
-    <div v-if="securityTarget" class="modal-mask" @click.self="securityTarget = null">
-      <div class="modal security-modal">
-        <header>
-          <h2>核验身份</h2>
-          <button class="icon" @click="securityTarget = null">×</button>
-        </header>
-        <section>
-          <p class="muted small">
-            请当面或通过其他可信渠道与对方核对下面的安全码。两端显示一致，说明服务器或中间人没有替换对方身份。
-          </p>
-          <div class="device-row">
-            <span class="muted small">设备 ID</span>
-            <code>{{ securityTarget }}</code>
-          </div>
-          <div v-if="formattedSafety" class="safety-code">{{ formattedSafety }}</div>
-          <p v-else class="muted small">该会话尚未建立，暂无安全码。</p>
-          <div class="row-actions">
-            <button class="small" :disabled="!formattedSafety" @click="copySafety">复制安全码</button>
-            <button class="primary small" @click="securityTarget = null">关闭</button>
-          </div>
-        </section>
-      </div>
-    </div>
-    <SettingsPanel
-      v-if="showSettings"
+
+    <SettingsSheet
+      v-if="showSettings && status"
+      :locale="locale"
       :status="status"
+      :accounts="accounts"
       @close="showSettings = false"
       @toast="showToast"
-      @refresh="(next) => { status = next; refreshStatus(); }"
+      @updated="onPreferences"
+      @add-account="openAddAccount"
     />
+
+    <AddContact
+      v-if="showAdd"
+      :locale="locale"
+      :devices="devices"
+      :paired="peers.map((peer) => peer.deviceId)"
+      :self-id="status.deviceId"
+      :busy="busy"
+      @close="showAdd = false"
+      @pair="requestPair"
+      @refresh="refreshLists"
+    />
+
+    <div v-if="showGroup" class="sheet-mask" @click.self="showGroup = false">
+      <div class="sheet">
+        <header class="sheet-header">
+          <h2>{{ t("group.create") }}</h2>
+          <button class="icon" @click="showGroup = false">×</button>
+        </header>
+        <section class="sheet-section">
+          <label class="field">
+            <span>{{ t("group.name") }}</span>
+            <input v-model="groupName" maxlength="40" />
+          </label>
+          <p class="muted small">{{ t("group.members") }}</p>
+          <label v-for="peer in pairedContacts" :key="peer.id" class="check-row">
+            <input
+              type="checkbox"
+              :checked="groupMembers.includes(peer.id)"
+              @change="toggleMember(peer.id)"
+            />
+            <span>{{ peer.title }}</span>
+          </label>
+          <button class="primary block" :disabled="busy || !groupName.trim()" @click="submitGroup">
+            {{ t("group.submit") }}
+          </button>
+        </section>
+      </div>
+    </div>
+
+    <div v-if="security" class="sheet-mask" @click.self="security = null">
+      <div class="sheet">
+        <header class="sheet-header">
+          <h2>{{ t("security.title") }}</h2>
+          <button class="icon" @click="security = null">×</button>
+        </header>
+        <section class="sheet-section">
+          <p class="muted small">{{ t("security.hint") }}</p>
+          <div v-if="security.code" class="safety-code">{{ groupSafety(security.code) }}</div>
+          <p v-else class="muted small">{{ t("security.none") }}</p>
+          <p class="muted small mono">{{ t("security.device") }}: {{ security.peer }}</p>
+          <div class="row-actions">
+            <button class="small" :disabled="!security.code" @click="copySafety">
+              {{ t("security.copy") }}
+            </button>
+            <button class="primary small" @click="security = null">{{ t("common.close") }}</button>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div v-if="confirming" class="sheet-mask" @click.self="confirming = null">
+      <div class="sheet small-sheet">
+        <header class="sheet-header">
+          <h2>{{ t("chat.remove") }}</h2>
+          <button class="icon" @click="confirming = null">×</button>
+        </header>
+        <section class="sheet-section">
+          <p>{{ t("chat.removeConfirm", { name: confirming.name }) }}</p>
+          <div class="row-actions">
+            <button class="small" @click="confirming = null">{{ t("common.cancel") }}</button>
+            <button class="small danger" @click="removeContact">{{ t("common.delete") }}</button>
+          </div>
+        </section>
+      </div>
+    </div>
   </div>
 </template>

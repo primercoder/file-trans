@@ -48,6 +48,12 @@ pub enum InboxEvent {
         name: String,
         size: u64,
     },
+    /// The server's device directory changed (someone registered or left).
+    DevicesChanged,
+    /// A peer removed this connection; the local session must be dropped.
+    PeerRemoved { peer: String },
+    /// A peer deleted its account entirely.
+    PeerDeleted { peer: String },
     FileUnavailable {
         file_id: String,
     },
@@ -162,6 +168,8 @@ pub struct Engine {
     name: Option<String>,
     token: Option<String>,
     spk_private: [u8; 32],
+    directory_epoch: u64,
+    directory_changed: bool,
 }
 
 impl Engine {
@@ -171,7 +179,7 @@ impl Engine {
         server_fingerprint: &str,
     ) -> Result<Self> {
         let store = Store::open(store_path)?;
-        let api = ApiClient::new(base_url, server_fingerprint)?;
+        let api = ApiClient::new(base_url, Some(server_fingerprint))?;
         let state = store.identity()?;
         let (identity, name, token, spk_private) = if let Some(state) = state {
             (
@@ -193,6 +201,7 @@ impl Engine {
             (identity, None, None, spk_private)
         };
         let device_id = identity.device_id();
+        let directory_epoch = store.meta_u64("directory_epoch")?.unwrap_or(0);
         Ok(Self {
             store,
             api,
@@ -201,6 +210,8 @@ impl Engine {
             name,
             token,
             spk_private,
+            directory_epoch,
+            directory_changed: false,
         })
     }
 
@@ -214,6 +225,7 @@ impl Engine {
         token: Option<String>,
         spk_private: [u8; 32],
     ) -> Self {
+        let directory_epoch = store.meta_u64("directory_epoch").ok().flatten().unwrap_or(0);
         Self {
             store,
             api,
@@ -222,6 +234,8 @@ impl Engine {
             name,
             token,
             spk_private,
+            directory_epoch,
+            directory_changed: false,
         }
     }
 
@@ -431,6 +445,57 @@ impl Engine {
         Ok(self
             .peer_identity(peer)?
             .map(|key| crate::safety_number(&self.identity.ed25519_public_key(), &key)))
+    }
+
+    /// Removes a paired contact locally and tells the peer when possible.
+    ///
+    /// The notice is a normal ratchet message with kind `unpair`, so a server
+    /// cannot forge it. If the notice cannot be delivered the local side is
+    /// still deleted: the user asked for removal, not for a retry loop.
+    pub async fn unpair(&mut self, peer: &str) -> Result<()> {
+        if let Some((state, status)) = self.store.session(peer)?
+            && status == "paired"
+            && let Ok(token) = self.token()
+        {
+            let mut session: Session = bincode::deserialize(&state)?;
+            let body = serde_json::json!({"ts": unix_time()?});
+            let message = session.encrypt(&serde_json::to_vec(&body)?, &session_ad(&session))?;
+            let _ = self.api.send(&token, peer, "unpair", encode(&message)?).await;
+        }
+        self.store.delete_session(peer)?;
+        self.store.remove_pending(peer)?;
+        Ok(())
+    }
+
+    /// Deletes this device's account on the server.
+    ///
+    /// The server broadcasts a `device_deleted` notice so peers drop the
+    /// contact. The caller is responsible for removing the local profile.
+    pub async fn delete_account(&mut self) -> Result<()> {
+        let token = self.token()?;
+        self.api.delete_account(&token).await?;
+        self.token = None;
+        Ok(())
+    }
+
+    fn receive_unpair(&self, from: &str, payload: &str) -> Result<EntryOutcome> {
+        let Some((state, status)) = self.store.session(from)? else {
+            return Ok(EntryOutcome::failed());
+        };
+        if status != "paired" {
+            return Ok(EntryOutcome::failed());
+        }
+        let mut session: Session = bincode::deserialize(&state)?;
+        let message: RatchetMessage = decode(payload)?;
+        let plaintext = session.decrypt(&message, &session_ad(&session))?;
+        let _: serde_json::Value = serde_json::from_slice(&plaintext)?;
+        Ok(EntryOutcome {
+            event: Some(InboxEvent::PeerRemoved {
+                peer: from.to_owned(),
+            }),
+            remove_session: Some(from.to_owned()),
+            ..EntryOutcome::default()
+        })
     }
 
     /// Decline an incoming pairing request. The peer receives `accepted=false`
@@ -872,7 +937,12 @@ impl Engine {
             // Retry cleanup for the previously committed but possibly un-ACKed prefix.
             let _ = self.api.ack(&token, cursor).await;
         }
-        let entries = self.api.sync(&token, cursor).await?;
+        let (entries, epoch) = self.api.sync(&token, cursor).await?;
+        if epoch != self.directory_epoch {
+            self.directory_epoch = epoch;
+            self.directory_changed = true;
+            self.store.set_meta_u64("directory_epoch", epoch)?;
+        }
         let mut events = Vec::new();
         let mut latest = None;
         for entry in entries {
@@ -896,6 +966,12 @@ impl Engine {
         Ok(events)
     }
 
+    /// Reports (once) that the server device directory changed since the last
+    /// poll, so the UI can refresh its contact discovery list.
+    pub fn take_directory_changed(&mut self) -> bool {
+        std::mem::take(&mut self.directory_changed)
+    }
+
     fn process_entry(&mut self, entry: &crate::api_client::MailEntry) -> Result<EntryOutcome> {
         match entry.kind.as_str() {
             "pair_req" => self.receive_pair_request(&entry.from, &entry.payload),
@@ -903,6 +979,8 @@ impl Engine {
             "msg" => self.receive_message(&entry.from, &entry.payload),
             "file" => self.receive_file_offer(&entry.from, &entry.payload),
             "file_evicted" => receive_file_unavailable(&entry.payload),
+            "notice" => receive_notice(entry),
+            "unpair" => self.receive_unpair(&entry.from, &entry.payload),
             "group_key" => self.receive_group_key(&entry.from, &entry.payload),
             "group_msg" => self.receive_group_message(entry),
             _ => Ok(EntryOutcome::failed()),
@@ -1234,6 +1312,33 @@ impl Engine {
 /// Server-authored eviction notices are unauthenticated plaintext JSON, not peer
 /// ciphertext. They are advisory hints only: they never alter pending-file state,
 /// authorize a download, or prove that an eviction actually occurred.
+/// Server-authored notices are the only entries accepted from `server`.
+fn receive_notice(entry: &crate::api_client::MailEntry) -> Result<EntryOutcome> {
+    if entry.from != "server" {
+        return Err(EngineError::Protocol("notice must come from server".into()));
+    }
+    let body: serde_json::Value = serde_json::from_slice(&B64.decode(&entry.payload)?)?;
+    match body["event"].as_str() {
+        Some("devices_changed") => Ok(EntryOutcome {
+            event: Some(InboxEvent::DevicesChanged),
+            ..EntryOutcome::default()
+        }),
+        Some("device_deleted") => {
+            let Some(device_id) = body["device_id"].as_str() else {
+                return Err(EngineError::Protocol("device_deleted without id".into()));
+            };
+            Ok(EntryOutcome {
+                event: Some(InboxEvent::PeerDeleted {
+                    peer: device_id.to_owned(),
+                }),
+                remove_session: Some(device_id.to_owned()),
+                ..EntryOutcome::default()
+            })
+        }
+        _ => Err(EngineError::Protocol("unknown notice".into())),
+    }
+}
+
 fn receive_file_unavailable(payload: &str) -> Result<EntryOutcome> {
     let notice: FileUnavailableNotice = serde_json::from_slice(&B64.decode(payload)?)?;
     if notice.file_id.is_empty() || notice.file_id.len() > 128 {

@@ -179,7 +179,7 @@ impl Engine {
         let device_id = identity.device_id();
         Ok(Self::from_backup_parts(
             store,
-            ApiClient::new(base_url, server_fingerprint)?,
+            ApiClient::new(base_url, Some(server_fingerprint))?,
             identity,
             device_id,
             state.name,

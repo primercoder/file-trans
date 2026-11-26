@@ -3,7 +3,7 @@ use std::path::Path;
 use axum::{
     Json, Router,
     extract::State,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use serde_json::json;
 
@@ -22,6 +22,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health))
         .route("/stats", get(api::stats::get))
         .route("/api/v1/register", post(api::auth::register))
+        .route("/api/v1/account", delete(api::auth::delete_account))
         .route("/api/v1/auth/challenge", post(api::auth::challenge))
         .route("/api/v1/auth/verify", post(api::auth::verify))
         .route("/api/v1/devices", get(api::directory::list))

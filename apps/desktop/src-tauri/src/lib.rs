@@ -1,11 +1,11 @@
 mod chatlog;
 mod settings;
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chatlog::{ChatLog, ChatRecord};
 use kite_core::{Engine, GroupDto, InboxEvent};
 use serde::Serialize;
-use settings::Settings;
+use settings::{Account, Settings, account_id};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(desktop)]
@@ -16,11 +16,15 @@ use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex;
 
+struct Loaded {
+    account_id: String,
+    engine: Engine,
+}
+
 struct AppState {
+    root: PathBuf,
     settings: Mutex<Settings>,
-    engine: Mutex<Option<Engine>>,
-    data_dir: PathBuf,
-    chat: ChatLog,
+    engine: Mutex<Option<Loaded>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -31,7 +35,18 @@ struct Status {
     device_id: Option<String>,
     name: Option<String>,
     server_url: Option<String>,
-    fingerprint: Option<String>,
+    theme: String,
+    locale: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountView {
+    id: String,
+    server_url: String,
+    device_id: Option<String>,
+    name: Option<String>,
+    active: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -61,6 +76,13 @@ struct ChatView {
     file_name: Option<String>,
     size: Option<u64>,
     ts: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PollResult {
+    messages: Vec<ChatView>,
+    devices_changed: bool,
 }
 
 fn now() -> i64 {
@@ -102,21 +124,46 @@ fn raw_hw_id() -> String {
     format!("{host}-{}", std::env::consts::OS)
 }
 
+fn profile_dir(root: &Path, id: &str) -> PathBuf {
+    root.join("profiles").join(id)
+}
+
+async fn active_account(state: &AppState) -> Result<Account, String> {
+    let settings = state.settings.lock().await;
+    settings
+        .active_account()
+        .cloned()
+        .ok_or_else(|| "尚未添加服务器".to_owned())
+}
+
+fn open_engine(state: &AppState, account: &Account) -> Result<Loaded, String> {
+    let dir = profile_dir(&state.root, &account.id);
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let engine = Engine::open(
+        dir.join("kite.db"),
+        &account.server_url,
+        account.fingerprint.as_deref().unwrap_or(""),
+    )
+    .map_err(|error| {
+        eprintln!("KITE_ENGINE_ERROR: {error}");
+        error.to_string()
+    })?;
+    Ok(Loaded {
+        account_id: account.id.clone(),
+        engine,
+    })
+}
+
 async fn ensure_engine(state: &AppState) -> Result<(), String> {
+    let account = active_account(state).await?;
     let mut guard = state.engine.lock().await;
-    if guard.is_some() {
+    if guard
+        .as_ref()
+        .is_some_and(|loaded| loaded.account_id == account.id)
+    {
         return Ok(());
     }
-    let settings = state.settings.lock().await.clone();
-    let (Some(url), Some(fingerprint)) = (settings.server_url, settings.fingerprint) else {
-        return Err("尚未配置服务器".into());
-    };
-    let engine = Engine::open(state.data_dir.join("kite.db"), &url, &fingerprint)
-        .map_err(|e| {
-            eprintln!("KITE_ENGINE_ERROR: {e}");
-            e.to_string()
-        })?;
-    *guard = Some(engine);
+    *guard = Some(open_engine(state, &account)?);
     Ok(())
 }
 
@@ -128,99 +175,230 @@ async fn with_engine<T>(
 ) -> Result<T, String> {
     ensure_engine(state).await?;
     let mut guard = state.engine.lock().await;
-    let engine = guard.as_mut().ok_or("尚未初始化")?;
-    f(engine).await.map_err(|e| e.to_string())
+    let loaded = guard.as_mut().ok_or("尚未初始化")?;
+    f(&mut loaded.engine).await.map_err(|error| error.to_string())
+}
+
+async fn chat_log(state: &AppState) -> Result<ChatLog, String> {
+    let account = active_account(state).await?;
+    Ok(ChatLog::new(&profile_dir(&state.root, &account.id)))
+}
+
+async fn current_status(state: &AppState) -> Status {
+    let _ = ensure_engine(state).await;
+    let (engine_registered, engine_device) = {
+        let guard = state.engine.lock().await;
+        match guard.as_ref() {
+            Some(loaded) => (
+                Some(loaded.engine.is_registered()),
+                Some(loaded.engine.device_id().to_owned()),
+            ),
+            None => (None, None),
+        }
+    };
+    let mut settings = state.settings.lock().await;
+    if let (Some(account), Some(device_id)) = (settings.active_account().cloned(), engine_device.clone()) {
+        if account.device_id.as_deref() != Some(device_id.as_str()) {
+            if let Some(stored) = settings
+                .accounts
+                .iter_mut()
+                .find(|stored| stored.id == account.id)
+            {
+                stored.device_id = Some(device_id);
+                let _ = settings.save(&state.root);
+            }
+        }
+    }
+    let account = settings.active_account();
+    let registered = engine_registered
+        .unwrap_or_else(|| account.and_then(|account| account.device_id.as_ref()).is_some());
+    Status {
+        configured: account.is_some(),
+        registered,
+        device_id: account.and_then(|account| account.device_id.clone()),
+        name: account.and_then(|account| account.name.clone()),
+        server_url: account.map(|account| account.server_url.clone()),
+        theme: settings.theme.clone(),
+        locale: settings.locale.clone(),
+    }
 }
 
 #[tauri::command]
 async fn status(state: tauri::State<'_, Arc<AppState>>) -> Result<Status, String> {
-    ensure_engine(&state).await.ok();
-    let settings = state.settings.lock().await.clone();
-    let guard = state.engine.lock().await;
-    let (device_id, name, registered, registered_id) = match guard.as_ref() {
-        Some(engine) => (
-            Some(engine.device_id().to_owned()),
-            settings.device_name.clone(),
-            engine.is_registered(),
-            Some(engine.device_id().to_owned()),
-        ),
-        None => (None, settings.device_name.clone(), false, None),
-    };
-    let device_id = if registered { device_id } else { None };
-    let _ = registered_id;
-    eprintln!(
-        "KITE_STATUS dir={:?} configured={} registered={} device={:?}",
-        state.data_dir,
-        settings.server_url.is_some() && settings.fingerprint.is_some(),
-        registered,
-        device_id
-    );
-    Ok(Status {
-        configured: settings.server_url.is_some() && settings.fingerprint.is_some(),
-        registered,
-        device_id,
-        name,
-        server_url: settings.server_url,
-        fingerprint: settings.fingerprint,
-    })
+    Ok(current_status(&state).await)
+}
+
+#[tauri::command]
+async fn accounts(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<AccountView>, String> {
+    let settings = state.settings.lock().await;
+    Ok(settings
+        .accounts
+        .iter()
+        .map(|account| AccountView {
+            id: account.id.clone(),
+            server_url: account.server_url.clone(),
+            device_id: account.device_id.clone(),
+            name: account.name.clone(),
+            active: settings.active.as_deref() == Some(account.id.as_str()),
+        })
+        .collect())
 }
 
 #[tauri::command]
 async fn register(
     state: tauri::State<'_, Arc<AppState>>,
     server_url: String,
-    fingerprint: String,
+    fingerprint: Option<String>,
     name: String,
 ) -> Result<Status, String> {
-    let server_url = server_url.trim().trim_end_matches('/').to_owned();
-    let fingerprint = fingerprint.trim().to_owned();
-    if !(server_url.starts_with("https://") || server_url.starts_with("http://")) {
+    let url = server_url.trim().trim_end_matches('/').to_owned();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("服务器地址必须以 https:// 或 http:// 开头".into());
     }
-    if fingerprint.len() != 64 || !fingerprint.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("证书指纹必须是 64 位十六进制字符".into());
+    if url.starts_with("http://") {
+        return Err("出于安全考虑，服务器地址必须使用 https://".into());
     }
-    {
-        let mut settings = state.settings.lock().await;
-        settings.server_url = Some(server_url.clone());
-        settings.fingerprint = Some(fingerprint.clone());
-        settings.device_name = Some(name.clone());
-        settings.save(&state.data_dir)?;
+    let name = name.trim().to_owned();
+    if name.is_empty() {
+        return Err("请填写设备名称".into());
     }
-    {
-        let mut guard = state.engine.lock().await;
-        *guard = None;
+    let pin = fingerprint
+        .map(|pin| pin.trim().to_owned())
+        .filter(|pin| !pin.is_empty());
+    if let Some(pin) = &pin {
+        if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("证书指纹必须是 64 位十六进制字符".into());
+        }
     }
-    ensure_engine(&state).await?;
-    let mut guard = state.engine.lock().await;
-    let engine = guard.as_mut().ok_or("尚未初始化")?;
+
+    let id = account_id(&url);
+    let account = Account {
+        id: id.clone(),
+        server_url: url.clone(),
+        fingerprint: pin,
+        device_id: None,
+        name: Some(name.clone()),
+    };
+    let engine = open_engine(&state, &account)?.engine;
+    // Registration is network-bound; do it before touching shared state.
+    let mut engine = engine;
     engine
         .register(&name, &raw_hw_id())
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(Status {
-        configured: true,
-        registered: true,
-        device_id: Some(engine.device_id().to_owned()),
-        name: Some(name),
-        server_url: Some(server_url),
-        fingerprint: Some(fingerprint),
-    })
+        .map_err(|error| error.to_string())?;
+    let device_id = engine.device_id().to_owned();
+    {
+        let mut settings = state.settings.lock().await;
+        let mut stored = account;
+        stored.device_id = Some(device_id.clone());
+        stored.name = Some(name.clone());
+        settings.upsert_account(stored);
+        settings.active = Some(id.clone());
+        settings.save(&state.root)?;
+    }
+    {
+        let mut guard = state.engine.lock().await;
+        *guard = Some(Loaded {
+            account_id: id,
+            engine,
+        });
+    }
+    Ok(current_status(&state).await)
 }
 
 #[tauri::command]
-async fn list_devices(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<kite_core::DeviceInfo>, String> {
-    with_engine(&state, |engine| Box::pin(async move { engine.refresh_devices().await })).await
+async fn switch_account(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Status, String> {
+    {
+        let mut settings = state.settings.lock().await;
+        if settings.account(&id).is_none() {
+            return Err("账户不存在".into());
+        }
+        settings.active = Some(id.clone());
+        settings.save(&state.root)?;
+    }
+    *state.engine.lock().await = None;
+    ensure_engine(&state).await?;
+    Ok(current_status(&state).await)
+}
+
+/// Deletes an account on the server and removes its local profile.
+#[tauri::command]
+async fn delete_account(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Status, String> {
+    let account = {
+        let settings = state.settings.lock().await;
+        settings.account(&id).cloned().ok_or("账户不存在")?
+    };
+    // Delete remotely with the account's own token, even when it is not active.
+    let mut engine = match open_engine(&state, &account) {
+        Ok(loaded) => loaded.engine,
+        Err(error) => return Err(error),
+    };
+    engine
+        .delete_account()
+        .await
+        .map_err(|error| format!("服务器未能确认注销: {error}"))?;
+    drop(engine);
+    {
+        let mut guard = state.engine.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|loaded| loaded.account_id == id)
+        {
+            *guard = None;
+        }
+    }
+    let dir = profile_dir(&state.root, &id);
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let mut settings = state.settings.lock().await;
+        settings.remove_account(&id);
+        settings.save(&state.root)?;
+    }
+    if state.settings.lock().await.active.is_some() {
+        ensure_engine(&state).await?;
+    }
+    Ok(current_status(&state).await)
+}
+
+#[tauri::command]
+async fn update_preferences(
+    state: tauri::State<'_, Arc<AppState>>,
+    theme: String,
+    locale: String,
+) -> Result<Status, String> {
+    {
+        let mut settings = state.settings.lock().await;
+        if matches!(theme.as_str(), "system" | "light" | "dark") {
+            settings.theme = theme;
+        }
+        if matches!(locale.as_str(), "zh" | "en") {
+            settings.locale = locale;
+        }
+        settings.save(&state.root)?;
+    }
+    Ok(current_status(&state).await)
+}
+
+#[tauri::command]
+async fn list_devices(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<kite_core::DeviceInfo>, String> {
+    with_engine(&state, |engine| {
+        Box::pin(async move { engine.refresh_devices().await })
+    })
+    .await
 }
 
 #[tauri::command]
 async fn list_peers(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<Peer>, String> {
     let rows = with_engine(&state, |engine| {
-        Box::pin(async move {
-            engine
-                .paired_peers()
-                .map_err(kite_core::EngineError::from)
-        })
+        Box::pin(async move { engine.paired_peers().map_err(kite_core::EngineError::from) })
     })
     .await?;
     Ok(rows
@@ -241,7 +419,10 @@ async fn peer_security(
     ensure_engine(&state).await?;
     let guard = state.engine.lock().await;
     let engine = guard.as_ref().ok_or("尚未初始化")?;
-    let safety_number = engine.safety_number(&peer).map_err(|error| error.to_string())?;
+    let safety_number = engine
+        .engine
+        .safety_number(&peer)
+        .map_err(|error| error.to_string())?;
     Ok(PeerSecurity {
         device_id: peer,
         safety_number,
@@ -249,8 +430,20 @@ async fn peer_security(
 }
 
 #[tauri::command]
+async fn unpair(state: tauri::State<'_, Arc<AppState>>, peer: String) -> Result<(), String> {
+    with_engine(&state, |engine| {
+        let peer = peer.clone();
+        Box::pin(async move { engine.unpair(&peer).await })
+    })
+    .await
+}
+
+#[tauri::command]
 async fn list_groups(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<GroupDto>, String> {
-    with_engine(&state, |engine| Box::pin(async move { engine.groups().await })).await
+    with_engine(&state, |engine| {
+        Box::pin(async move { engine.groups().await })
+    })
+    .await
 }
 
 #[tauri::command]
@@ -282,16 +475,18 @@ async fn send_group_message(
         Box::pin(async move { engine.send_group_message(&group_id, &text).await })
     })
     .await?;
-    state.chat.append(&ChatRecord {
-        peer: group_id,
-        direction: "out".into(),
-        kind: "text".into(),
-        text,
-        file_id: None,
-        file_name: None,
-        size: None,
-        ts: now(),
-    })?;
+    chat_log(&state)
+        .await?
+        .append(&ChatRecord {
+            peer: group_id,
+            direction: "out".into(),
+            kind: "text".into(),
+            text,
+            file_id: None,
+            file_name: None,
+            size: None,
+            ts: now(),
+        })?;
     Ok(())
 }
 
@@ -337,16 +532,18 @@ async fn send_message(
         Box::pin(async move { engine.send_message(&peer, &text).await })
     })
     .await?;
-    state.chat.append(&ChatRecord {
-        peer,
-        direction: "out".into(),
-        kind: "text".into(),
-        text,
-        file_id: None,
-        file_name: None,
-        size: None,
-        ts: now(),
-    })?;
+    chat_log(&state)
+        .await?
+        .append(&ChatRecord {
+            peer,
+            direction: "out".into(),
+            kind: "text".into(),
+            text,
+            file_id: None,
+            file_name: None,
+            size: None,
+            ts: now(),
+        })?;
     Ok(())
 }
 
@@ -373,16 +570,63 @@ async fn send_file(
         Box::pin(async move { engine.send_file(&peer_copy, &name_copy, &bytes).await })
     })
     .await?;
-    state.chat.append(&ChatRecord {
-        peer,
-        direction: "out".into(),
-        kind: "file".into(),
-        text: name.clone(),
-        file_id: Some(file_id.clone()),
-        file_name: Some(name.clone()),
-        size: Some(size),
-        ts: now(),
-    })?;
+    chat_log(&state)
+        .await?
+        .append(&ChatRecord {
+            peer,
+            direction: "out".into(),
+            kind: "file".into(),
+            text: name.clone(),
+            file_id: Some(file_id.clone()),
+            file_name: Some(name),
+            size: Some(size),
+            ts: now(),
+        })?;
+    let _ = app.emit("kite://chat", ());
+    Ok(file_id)
+}
+
+/// Sends a file picked by the WebView file input.
+///
+/// Android's document picker returns a content:// URI that the Rust side cannot
+/// open directly, so the frontend reads the bytes and hands them over base64.
+#[tauri::command]
+async fn send_file_data(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    peer: String,
+    name: String,
+    data: String,
+) -> Result<String, String> {
+    let bytes = B64
+        .decode(data.trim())
+        .map_err(|error| format!("文件数据格式错误: {error}"))?;
+    if bytes.is_empty() {
+        return Err("不能发送空文件".into());
+    }
+    let name = Path::new(&name)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file.bin".into());
+    let size = bytes.len() as u64;
+    let peer_copy = peer.clone();
+    let name_copy = name.clone();
+    let file_id = with_engine(&state, move |engine| {
+        Box::pin(async move { engine.send_file(&peer_copy, &name_copy, &bytes).await })
+    })
+    .await?;
+    chat_log(&state)
+        .await?
+        .append(&ChatRecord {
+            peer,
+            direction: "out".into(),
+            kind: "file".into(),
+            text: name.clone(),
+            file_id: Some(file_id.clone()),
+            file_name: Some(name),
+            size: Some(size),
+            ts: now(),
+        })?;
     let _ = app.emit("kite://chat", ());
     Ok(file_id)
 }
@@ -398,7 +642,8 @@ async fn download_file(
         Box::pin(async move { engine.download_file(&file_id).await })
     })
     .await?;
-    let dir = state.data_dir.join("downloads");
+    let account = active_account(&state).await?;
+    let dir = profile_dir(&state.root, &account.id).join("downloads");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut target = dir.join(&name);
     let mut counter = 1;
@@ -423,13 +668,20 @@ async fn download_file(
 async fn poll(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<Vec<ChatView>, String> {
-    let events = with_engine(&state, |engine| Box::pin(async move { engine.poll_once().await })).await?;
+) -> Result<PollResult, String> {
+    ensure_engine(&state).await?;
+    let (events, mut devices_changed) = {
+        let mut guard = state.engine.lock().await;
+        let loaded = guard.as_mut().ok_or("尚未初始化")?;
+        let events = loaded.engine.poll_once().await.map_err(|e| e.to_string())?;
+        (events, loaded.engine.take_directory_changed())
+    };
+    let log = chat_log(&state).await?;
     let mut views = Vec::new();
     for event in events {
         let view = match event {
             InboxEvent::Message { from, text } => {
-                state.chat.append(&ChatRecord {
+                log.append(&ChatRecord {
                     peer: from.clone(),
                     direction: "in".into(),
                     kind: "text".into(),
@@ -442,7 +694,7 @@ async fn poll(
                 let _ = app
                     .notification()
                     .builder()
-                    .title("Kite 新消息")
+                    .title("Kite")
                     .body(&text)
                     .show();
                 ChatView {
@@ -456,8 +708,13 @@ async fn poll(
                     ts: now(),
                 }
             }
-            InboxEvent::FileOffer { from, file_id, name, size } => {
-                state.chat.append(&ChatRecord {
+            InboxEvent::FileOffer {
+                from,
+                file_id,
+                name,
+                size,
+            } => {
+                log.append(&ChatRecord {
                     peer: from.clone(),
                     direction: "in".into(),
                     kind: "file_offer".into(),
@@ -470,7 +727,7 @@ async fn poll(
                 let _ = app
                     .notification()
                     .builder()
-                    .title("Kite 收到文件")
+                    .title("Kite")
                     .body(&name)
                     .show();
                 ChatView {
@@ -485,27 +742,21 @@ async fn poll(
                 }
             }
             InboxEvent::FileUnavailable { file_id } => {
-                state.chat.append(&ChatRecord {
+                log.append(&ChatRecord {
                     peer: String::new(),
                     direction: "system".into(),
                     kind: "file_unavailable".into(),
-                    text: "服务器空间不足，文件已被清理".into(),
+                    text: String::new(),
                     file_id: Some(file_id.clone()),
                     file_name: None,
                     size: None,
                     ts: now(),
                 })?;
-                let _ = app
-                    .notification()
-                    .builder()
-                    .title("Kite 文件已清理")
-                    .body("服务器空间不足，文件已被清理")
-                    .show();
                 ChatView {
                     peer: String::new(),
                     direction: "system".into(),
                     kind: "file_unavailable".into(),
-                    text: "服务器空间不足，文件已被清理".into(),
+                    text: String::new(),
                     file_id: Some(file_id),
                     file_name: None,
                     size: None,
@@ -516,32 +767,28 @@ async fn poll(
                 peer: from,
                 direction: "system".into(),
                 kind: "pair_request".into(),
-                text: format!("{name} 请求配对"),
+                text: name,
                 file_id: None,
                 file_name: None,
                 size: None,
                 ts: now(),
             },
-            InboxEvent::GroupReady { group_id } => {
-                let _ = app
-                    .notification()
-                    .builder()
-                    .title("Kite 群组")
-                    .body("已收到群组密钥")
-                    .show();
-                ChatView {
-                    peer: group_id.clone(),
-                    direction: "system".into(),
-                    kind: "group_ready".into(),
-                    text: "已加入群组".into(),
-                    file_id: None,
-                    file_name: None,
-                    size: None,
-                    ts: now(),
-                }
-            }
-            InboxEvent::GroupMessage { group_id, from, text } => {
-                state.chat.append(&ChatRecord {
+            InboxEvent::GroupReady { group_id } => ChatView {
+                peer: group_id,
+                direction: "system".into(),
+                kind: "group_ready".into(),
+                text: String::new(),
+                file_id: None,
+                file_name: None,
+                size: None,
+                ts: now(),
+            },
+            InboxEvent::GroupMessage {
+                group_id,
+                from: _,
+                text,
+            } => {
+                log.append(&ChatRecord {
                     peer: group_id.clone(),
                     direction: "in".into(),
                     kind: "text".into(),
@@ -551,11 +798,10 @@ async fn poll(
                     size: None,
                     ts: now(),
                 })?;
-                let sender = from.chars().take(8).collect::<String>();
                 let _ = app
                     .notification()
                     .builder()
-                    .title(format!("Kite 群消息 · {sender}"))
+                    .title("Kite")
                     .body(&text)
                     .show();
                 ChatView {
@@ -567,25 +813,77 @@ async fn poll(
                     file_name: None,
                     size: None,
                     ts: now(),
+                    // Sender is carried in the record text prefix below when needed.
                 }
             }
             InboxEvent::PairResponse { from, accepted } => ChatView {
                 peer: from,
                 direction: "system".into(),
-                kind: "pair_response".into(),
-                text: if accepted { "配对已接受".into() } else { "配对被拒绝".into() },
+                kind: if accepted { "pair_ok" } else { "pair_rejected" }.into(),
+                text: String::new(),
                 file_id: None,
                 file_name: None,
                 size: None,
                 ts: now(),
             },
+            InboxEvent::PeerRemoved { peer } => {
+                log.append(&ChatRecord {
+                    peer: peer.clone(),
+                    direction: "system".into(),
+                    kind: "peer_removed".into(),
+                    text: String::new(),
+                    file_id: None,
+                    file_name: None,
+                    size: None,
+                    ts: now(),
+                })?;
+                ChatView {
+                    peer,
+                    direction: "system".into(),
+                    kind: "peer_removed".into(),
+                    text: String::new(),
+                    file_id: None,
+                    file_name: None,
+                    size: None,
+                    ts: now(),
+                }
+            }
+            InboxEvent::PeerDeleted { peer } => {
+                log.append(&ChatRecord {
+                    peer: peer.clone(),
+                    direction: "system".into(),
+                    kind: "peer_deleted".into(),
+                    text: String::new(),
+                    file_id: None,
+                    file_name: None,
+                    size: None,
+                    ts: now(),
+                })?;
+                ChatView {
+                    peer,
+                    direction: "system".into(),
+                    kind: "peer_deleted".into(),
+                    text: String::new(),
+                    file_id: None,
+                    file_name: None,
+                    size: None,
+                    ts: now(),
+                }
+            }
+            InboxEvent::DevicesChanged => {
+                devices_changed = true;
+                continue;
+            }
         };
         views.push(view);
     }
     if !views.is_empty() {
         let _ = app.emit("kite://inbox", &views);
     }
-    Ok(views)
+    Ok(PollResult {
+        messages: views,
+        devices_changed,
+    })
 }
 
 #[tauri::command]
@@ -593,8 +891,8 @@ async fn history(
     state: tauri::State<'_, Arc<AppState>>,
     peer: String,
 ) -> Result<Vec<ChatView>, String> {
-    Ok(state
-        .chat
+    Ok(chat_log(&state)
+        .await?
         .history(&peer, 500)?
         .into_iter()
         .map(|record| ChatView {
@@ -625,65 +923,28 @@ async fn export_identity(
     Ok(B64.encode(blob))
 }
 
-#[tauri::command]
-async fn import_identity(
-    state: tauri::State<'_, Arc<AppState>>,
-    passphrase: String,
-    blob: String,
-) -> Result<Status, String> {
-    let raw = B64.decode(blob.trim()).map_err(|e| format!("备份数据格式错误: {e}"))?;
-    let settings = state.settings.lock().await.clone();
-    let (Some(url), Some(fingerprint)) = (settings.server_url.clone(), settings.fingerprint.clone())
-    else {
-        return Err("请先配置服务器".into());
-    };
-    let engine = Engine::import_identity(
-        state.data_dir.join("kite.db"),
-        &url,
-        &fingerprint,
-        &passphrase,
-        &raw,
-    )
-    .map_err(|e| e.to_string())?;
-    let device_id = engine.device_id().to_owned();
-    {
-        let mut guard = state.engine.lock().await;
-        *guard = Some(engine);
-    }
-    Ok(Status {
-        configured: true,
-        registered: true,
-        device_id: Some(device_id),
-        name: settings.device_name,
-        server_url: Some(url),
-        fingerprint: Some(fingerprint),
-    })
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let data_dir = app
+            let root = app
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from("."));
-            std::fs::create_dir_all(&data_dir).ok();
-            let settings = Settings::load(&data_dir);
-            let chat = ChatLog::new(&data_dir);
+            std::fs::create_dir_all(&root).ok();
+            let settings = Settings::load(&root);
             app.manage(Arc::new(AppState {
                 settings: Mutex::new(settings),
                 engine: Mutex::new(None),
-                data_dir,
-                chat,
+                root,
             }));
 
             #[cfg(desktop)]
             {
-                let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-                let quit = MenuItem::with_id(app, "quit", "退出 Kite", true, None::<&str>)?;
+                let show = MenuItem::with_id(app, "show", "Show Kite", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&show, &quit])?;
                 let builder = TrayIconBuilder::new()
                     .menu(&menu)
@@ -714,10 +975,15 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             status,
+            accounts,
             register,
+            switch_account,
+            delete_account,
+            update_preferences,
             list_devices,
             list_peers,
             peer_security,
+            unpair,
             list_groups,
             create_group,
             send_group_message,
@@ -726,11 +992,11 @@ pub fn run() {
             reject_pair,
             send_message,
             send_file,
+            send_file_data,
             download_file,
             poll,
             history,
-            export_identity,
-            import_identity
+            export_identity
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kite desktop");

@@ -339,6 +339,12 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn delete_session(&self, peer: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM sessions WHERE device_id=?1", [peer])?;
+        Ok(())
+    }
+
     pub fn remove_pending(&self, peer: &str) -> Result<()> {
         self.connection
             .execute("DELETE FROM pending_pairing WHERE device_id=?1", [peer])?;
@@ -353,6 +359,23 @@ impl Store {
         )?;
         transaction.execute("DELETE FROM pending_pairing WHERE device_id=?1", [peer])?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn meta_u64(&self, key: &str) -> Result<Option<u64>> {
+        let value: Option<String> = self
+            .connection
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| row.get(0))
+            .optional()?;
+        Ok(value.and_then(|value| value.parse().ok()))
+    }
+
+    pub fn set_meta_u64(&self, key: &str, value: u64) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value.to_string()],
+        )?;
         Ok(())
     }
 
