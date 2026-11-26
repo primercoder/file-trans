@@ -21,4 +21,7 @@ __pycache__/
 *.iml
 coverage/
 .superpowers/
-apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/gen/schemas/
+apps/desktop/src-tauri/gen/android/.gradle/
+apps/desktop/src-tauri/gen/android/build/
+apps/desktop/src-tauri/gen/android/app/build/

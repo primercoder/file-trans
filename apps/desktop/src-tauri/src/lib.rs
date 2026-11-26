@@ -104,7 +104,10 @@ async fn ensure_engine(state: &AppState) -> Result<(), String> {
         return Err("尚未配置服务器".into());
     };
     let engine = Engine::open(state.data_dir.join("kite.db"), &url, &fingerprint)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            eprintln!("KITE_ENGINE_ERROR: {e}");
+            e.to_string()
+        })?;
     *guard = Some(engine);
     Ok(())
 }
@@ -137,6 +140,13 @@ async fn status(state: tauri::State<'_, Arc<AppState>>) -> Result<Status, String
     };
     let device_id = if registered { device_id } else { None };
     let _ = registered_id;
+    eprintln!(
+        "KITE_STATUS dir={:?} configured={} registered={} device={:?}",
+        state.data_dir,
+        settings.server_url.is_some() && settings.fingerprint.is_some(),
+        registered,
+        device_id
+    );
     Ok(Status {
         configured: settings.server_url.is_some() && settings.fingerprint.is_some(),
         registered,

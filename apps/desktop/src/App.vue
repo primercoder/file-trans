@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
+import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api, formatSize, shortId } from "./api";
 import type { ChatView, DeviceInfo, Peer, Status } from "./types";
@@ -18,6 +19,7 @@ const busy = ref(false);
 const toast = ref("");
 const showSettings = ref(false);
 const dragOver = ref(false);
+const isMobile = ref(false);
 let timer: number | undefined;
 
 const deviceNames = computed(() => {
@@ -184,6 +186,14 @@ function handleReady(next: Status) {
 }
 
 onMounted(async () => {
+  const media = window.matchMedia("(max-width: 720px)");
+  isMobile.value = media.matches;
+  media.addEventListener("change", (event) => (isMobile.value = event.matches));
+  try {
+    if (!(await isPermissionGranted())) await requestPermission();
+  } catch (error) {
+    console.warn("notification permission unavailable", error);
+  }
   await refreshStatus();
   timer = window.setInterval(poll, 2000);
   try {
@@ -213,7 +223,7 @@ watch(activePeer, (peer) => {
 <template>
   <div v-if="!status" class="loading">正在启动…</div>
   <Onboarding v-else-if="!status.registered" @ready="handleReady" @error="showToast" />
-  <div v-else class="shell">
+  <div v-else class="shell" :class="{ 'show-sidebar': isMobile && !activePeer, mobile: isMobile }">
     <aside class="sidebar">
       <div class="brand">
         <img src="/kite-icon.png" alt="" class="brand-icon" />
@@ -255,6 +265,7 @@ watch(activePeer, (peer) => {
     <main class="chat">
       <template v-if="activePeer">
         <header class="chat-header">
+          <button v-if="isMobile" class="icon back" @click="activePeer = null">←</button>
           <div>
             <strong>{{ activePeerName }}</strong>
             <span class="muted small">{{ shortId(activePeer) }}</span>
