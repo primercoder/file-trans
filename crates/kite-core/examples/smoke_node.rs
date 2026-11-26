@@ -154,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("TEXT_RECEIVED_OK");
                         }
                         InboxEvent::FileOffer {
+                            from: _,
                             file_id,
                             name,
                             size,

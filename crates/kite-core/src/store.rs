@@ -195,6 +195,17 @@ impl Store {
             .optional()?)
     }
 
+    /// All known sessions with their pairing status, for UI peer lists.
+    pub fn sessions(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT device_id,status FROM sessions ORDER BY device_id")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn save_pending(&self, peer: &str, name: &str, challenge: [u8; 32]) -> Result<()> {
         self.connection.execute(
             "INSERT INTO pending_pairing(device_id,name,challenge) VALUES(?1,?2,?3)

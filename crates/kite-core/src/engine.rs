@@ -41,6 +41,7 @@ pub enum InboxEvent {
         text: String,
     },
     FileOffer {
+        from: String,
         file_id: String,
         name: String,
         size: u64,
@@ -167,6 +168,11 @@ impl Engine {
 
     pub fn device_id(&self) -> &str {
         &self.device_id
+    }
+
+    /// Whether this store has completed server registration (has a token).
+    pub fn is_registered(&self) -> bool {
+        self.token.is_some()
     }
 
     pub async fn register(&mut self, name: &str, raw_hw_id: &str) -> Result<()> {
@@ -323,6 +329,51 @@ impl Engine {
         self.store
             .save_session(peer, &bincode::serialize(&session)?, "paired")?;
         self.store.remove_pending(peer)?;
+        Ok(())
+    }
+
+    /// Paired peers with their local session status, for the desktop UI.
+    pub fn paired_peers(&self) -> Result<Vec<(String, String)>> {
+        self.store.sessions()
+    }
+
+    /// Decline an incoming pairing request. The peer receives `accepted=false`
+    /// and any local pending state is discarded.
+    pub async fn reject_pairing(&mut self, peer: &str) -> Result<()> {
+        let Some((state, status)) = self.store.session(peer)? else {
+            return Err(EngineError::Protocol("no pairing session for peer".into()));
+        };
+        if status != "pending_accept" {
+            return Err(EngineError::Protocol(
+                "pairing is not awaiting acceptance".into(),
+            ));
+        }
+        let (_, challenge) = self
+            .store
+            .pending(peer)?
+            .ok_or_else(|| EngineError::Protocol("pairing request is not pending".into()))?;
+        let response_body = PairResponseBody {
+            challenge,
+            ts: unix_time()?,
+        };
+        let mut session: Session = bincode::deserialize(&state)?;
+        let body = session.encrypt(&bincode::serialize(&response_body)?, &[])?;
+        let response = PairResponseWire {
+            version: 1,
+            accepted: false,
+            body: encode(&body)?,
+        };
+        let _ = self
+            .api
+            .pair_response(
+                &self.token()?,
+                peer,
+                false,
+                B64.encode(serde_json::to_vec(&response)?),
+            )
+            .await;
+        self.store.remove_pending(peer)?;
+        self.store.rollback_pairing(peer, "pending_accept")?;
         Ok(())
     }
 
@@ -743,6 +794,7 @@ impl Engine {
             return Err(EngineError::Protocol("inconsistent file offer".into()));
         }
         let event = InboxEvent::FileOffer {
+            from: from.to_owned(),
             file_id: body.file_id.clone(),
             name: body.name.clone(),
             size: body.size,

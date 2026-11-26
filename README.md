@@ -173,3 +173,23 @@ M2 新增 Bearer 鉴权文件 API：
 ## 设计文档
 
 完整设计见 `reference/tech-design.md`（§2 安全设计、§3 架构、§4 数据模型、§6 传输协议）。`reference/` 为本地参考资料且已被 Git 排除；核心约定为设备持有 Ed25519 身份，X3DH 与 Double Ratchet 保护消息，服务端只处理认证后的 REST 请求和密文信箱数据。
+
+## 桌面客户端（M3）
+
+`apps/desktop` 是基于 Tauri 2 + Vue 3 的桌面客户端（Linux / Windows），复用 `kite-core`
+的协议与加密能力：
+
+```bash
+cd apps/desktop
+npm install
+npm run tauri dev      # 开发模式（需系统 WebView：Linux 为 webkit2gtk-4.1）
+npm run tauri build    # 生产打包
+```
+
+功能：设备注册（服务器地址 + 证书指纹 + 设备名）、设备发现与配对（接受/拒绝）、
+消息与文件传输、拖拽发送文件、系统托盘常驻、系统通知、身份导出/导入设置页。
+
+首次启动填写服务器地址与 `fingerprint.txt` 中的 SHA-256 指纹即可注册；界面按
+`icon.png` 的蓝白配色设计。Linux 无图形会话的 CI 环境可用
+`xvfb-run` + `dbus-run-session` 做启动冒烟。
+

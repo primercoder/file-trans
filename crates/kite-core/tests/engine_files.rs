@@ -139,7 +139,7 @@ async fn file_round_trip_recipient_authorization_ack_and_idempotent_download() {
     let events = bob.poll_once().await.unwrap();
     assert!(matches!(
         events.as_slice(),
-        [InboxEvent::FileOffer { file_id: offered, name: offered_name, size }]
+        [InboxEvent::FileOffer { file_id: offered, name: offered_name, size, .. }]
             if *offered == file_id && offered_name == name && *size == original.len() as u64
     ));
 

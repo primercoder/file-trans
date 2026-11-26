@@ -21,3 +21,4 @@ __pycache__/
 *.iml
 coverage/
 .superpowers/
+apps/desktop/src-tauri/gen/
