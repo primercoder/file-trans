@@ -528,10 +528,11 @@ async fn poll(
                     size: None,
                     ts: now(),
                 })?;
+                let sender = from.chars().take(8).collect::<String>();
                 let _ = app
                     .notification()
                     .builder()
-                    .title("Kite 群消息")
+                    .title(format!("Kite 群消息 · {sender}"))
                     .body(&text)
                     .show();
                 ChatView {

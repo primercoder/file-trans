@@ -85,6 +85,10 @@ echo "SERVER_OK bind=0.0.0.0:$API_PORT fingerprint=$fingerprint"
 
 # Ship exactly the tested source (not target/, VCS metadata, or local databases).
 tar --exclude='./target' --exclude='./.git' --exclude='./.superpowers' \
+    --exclude='./apps/desktop/node_modules' --exclude='./apps/desktop/src-tauri/target' \
+    --exclude='./apps/desktop/src-tauri/gen/android/app/build' \
+    --exclude='./apps/desktop/src-tauri/gen/android/build' \
+    --exclude='./apps/desktop/src-tauri/gen/android/.gradle' \
     --exclude='*.db' --exclude='*.db-*' --exclude='*.log' \
     -C "$ROOT" -cf "$WORK_DIR/source.tar" .
 ssh -o BatchMode=yes "$HOST" "cmd /c \"if not exist $REMOTE_DIR mkdir $REMOTE_DIR\""
