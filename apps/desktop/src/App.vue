@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api, formatSize, shortId } from "./api";
-import type { ChatView, DeviceInfo, GroupDto, Peer, Status } from "./types";
+import type { ChatView, DeviceInfo, GroupDto, Peer, PeerSecurity, Status } from "./types";
 import Onboarding from "./components/Onboarding.vue";
 import MessageItem from "./components/MessageItem.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
@@ -24,6 +24,9 @@ const isMobile = ref(false);
 const showCreateGroup = ref(false);
 const groupName = ref("");
 const groupMembers = ref<string[]>([]);
+const manualPeer = ref("");
+const security = ref<PeerSecurity | null>(null);
+const securityTarget = ref<string | null>(null);
 let timer: number | undefined;
 
 const deviceNames = computed(() => {
@@ -110,12 +113,47 @@ async function selectPeer(peer: string) {
 }
 
 async function requestPair(deviceId: string) {
+  const peer = deviceId.trim().toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(peer)) {
+    showToast("设备 ID 必须是 32 位十六进制字符");
+    return;
+  }
   try {
-    await api.pair(deviceId);
+    await api.pair(peer);
+    manualPeer.value = "";
     showToast("配对请求已发送，等待对方确认");
     await refreshLists();
   } catch (error) {
     showToast(String(error));
+  }
+}
+
+/// Opens the out-of-band identity check for a peer (paired or pending).
+async function openSecurity(peer: string) {
+  securityTarget.value = peer;
+  security.value = null;
+  try {
+    security.value = await api.peerSecurity(peer);
+  } catch (error) {
+    showToast(String(error));
+    securityTarget.value = null;
+  }
+}
+
+const formattedSafety = computed(() => {
+  const code = security.value?.safetyNumber;
+  if (!code) return "";
+  return (code.match(/.{5}/g) || [code]).join(" ");
+});
+
+async function copySafety() {
+  const code = formattedSafety.value;
+  if (!code) return;
+  try {
+    await navigator.clipboard.writeText(code);
+    showToast("安全码已复制，请通过其他渠道与对方核对");
+  } catch {
+    showToast("复制失败，请手动核对");
   }
 }
 
@@ -308,13 +346,27 @@ watch(activePeer, (peer) => {
         </span>
       </button>
 
+      <div class="section-title">按设备 ID 配对</div>
+      <div class="manual-pair">
+        <input
+          v-model="manualPeer"
+          placeholder="对方设备 ID（32 位）"
+          spellcheck="false"
+          @keydown.enter="requestPair(manualPeer)"
+        />
+        <button class="small" :disabled="!manualPeer.trim()" @click="requestPair(manualPeer)">
+          配对
+        </button>
+      </div>
+      <p class="muted small pad">设备 ID 是对方身份公钥的指纹，可线下交换，不必依赖服务器目录。</p>
+
       <div class="section-title">发现设备</div>
       <div v-if="!discoverable.length" class="muted small pad">暂无其他设备</div>
       <div v-for="device in discoverable" :key="device.device_id" class="peer">
         <span class="avatar">{{ device.name.slice(0, 1) }}</span>
         <span class="peer-info">
           <strong>{{ device.name }}</strong>
-          <span class="muted small">{{ device.online ? "在线" : "离线" }}</span>
+          <span class="muted small">{{ shortId(device.device_id) }} · {{ device.online ? "在线" : "离线" }}</span>
         </span>
         <button class="small" @click="requestPair(device.device_id)">配对</button>
       </div>
@@ -328,11 +380,24 @@ watch(activePeer, (peer) => {
             <strong>{{ activePeerName }}</strong>
             <span class="muted small">{{ shortId(activePeer) }}</span>
           </div>
+          <button
+            v-if="!activeGroup"
+            class="small ghost security"
+            title="核验对方身份的安全码"
+            @click="openSecurity(activePeer)"
+          >
+            安全码
+          </button>
         </header>
         <div class="messages">
           <div v-if="pendingForActive" class="pair-banner">
-            <span>对方请求与你配对</span>
+            <span>
+              对方请求与你配对
+              <br />
+              <span class="muted small">设备 {{ pendingForActive.peer }}</span>
+            </span>
             <div>
+              <button class="small ghost" @click="openSecurity(pendingForActive.peer)">核验身份</button>
               <button class="primary small" @click="acceptPair(pendingForActive.peer)">接受</button>
               <button class="small" @click="rejectPair(pendingForActive.peer)">拒绝</button>
             </div>
@@ -386,6 +451,29 @@ watch(activePeer, (peer) => {
             <span>{{ deviceNames[peer.deviceId] || shortId(peer.deviceId) }}</span>
           </label>
           <button class="primary" @click="submitGroup">创建并分发密钥</button>
+        </section>
+      </div>
+    </div>
+    <div v-if="securityTarget" class="modal-mask" @click.self="securityTarget = null">
+      <div class="modal security-modal">
+        <header>
+          <h2>核验身份</h2>
+          <button class="icon" @click="securityTarget = null">×</button>
+        </header>
+        <section>
+          <p class="muted small">
+            请当面或通过其他可信渠道与对方核对下面的安全码。两端显示一致，说明服务器或中间人没有替换对方身份。
+          </p>
+          <div class="device-row">
+            <span class="muted small">设备 ID</span>
+            <code>{{ securityTarget }}</code>
+          </div>
+          <div v-if="formattedSafety" class="safety-code">{{ formattedSafety }}</div>
+          <p v-else class="muted small">该会话尚未建立，暂无安全码。</p>
+          <div class="row-actions">
+            <button class="small" :disabled="!formattedSafety" @click="copySafety">复制安全码</button>
+            <button class="primary small" @click="securityTarget = null">关闭</button>
+          </div>
         </section>
       </div>
     </div>

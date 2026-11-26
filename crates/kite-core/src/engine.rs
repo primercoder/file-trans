@@ -67,6 +67,16 @@ struct GroupKeyBody {
     key_b64: String,
     version: u8,
     ts: i64,
+    /// Identity keys of every member, so each recipient can authenticate group
+    /// messages from members it is not directly paired with.
+    #[serde(default)]
+    members: Vec<GroupKeyMember>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GroupKeyMember {
+    device_id: String,
+    ik_b64: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,10 +85,29 @@ struct GroupMessageBody {
     nonce_b64: String,
     ct_b64: String,
     ts: i64,
+    /// Ed25519 signature by the sender over `group_signed_bytes`.
+    #[serde(default)]
+    sig_b64: String,
 }
 
 fn group_aad(group_id: &str, sender: &str, seq: i64) -> Vec<u8> {
     format!("kite-group-v1|{group_id}|{sender}|{seq}").into_bytes()
+}
+
+/// Canonical bytes covered by a group message signature: the AEAD associated
+/// data followed by the nonce and ciphertext. Binding the ciphertext prevents a
+/// group member from re-signing someone else's message under its own identity.
+fn group_signed_bytes(
+    group_id: &str,
+    sender: &str,
+    seq: i64,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let mut bytes = group_aad(group_id, sender, seq);
+    bytes.extend_from_slice(nonce);
+    bytes.extend_from_slice(ciphertext);
+    bytes
 }
 
 #[derive(Serialize, Deserialize)]
@@ -277,6 +306,14 @@ impl Engine {
         let token = self.token()?;
         let dto = self.api.bundle(&token, peer).await?;
         let bundle = decode_bundle(dto)?;
+        // Bind the fetched bundle to the device id the user asked for. Without
+        // this check a server that controls its own database could answer with a
+        // key it owns and silently impersonate the peer.
+        if crate::identity::device_id_for_public(&bundle.ik_pub) != peer {
+            return Err(EngineError::Protocol(
+                "peer bundle identity does not match device id".into(),
+            ));
+        }
         let x3dh = InitiatorKeys::run(&bundle, &self.identity)?;
         let ad = associated_data(&self.identity.ed25519_public_key(), &bundle.ik_pub);
         let mut session = Session::init_as_initiator(x3dh.shared_secret, ad, bundle.spk)?;
@@ -367,6 +404,35 @@ impl Engine {
         self.store.sessions()
     }
 
+    /// Recovers the peer's Ed25519 identity key from the authenticated session.
+    ///
+    /// Returns `None` when no session exists. The key comes from the session
+    /// associated data, which every message authenticates, so it cannot be
+    /// swapped by a server without breaking decryption.
+    pub fn peer_identity(&self, peer: &str) -> Result<Option<[u8; 32]>> {
+        let Some((state, _)) = self.store.session(peer)? else {
+            return Ok(None);
+        };
+        let session: Session = bincode::deserialize(&state)?;
+        let own = self.identity.ed25519_public_key();
+        Ok(session
+            .identity_binding()
+            .map(|(initiator, responder)| {
+                if initiator != own { initiator } else { responder }
+            })
+            .filter(|key| *key != own))
+    }
+
+    /// The 60-digit safety number for a session, or `None` when unpaired.
+    ///
+    /// Both sides derive the same value. Users compare it out of band to rule
+    /// out a server that substitutes directory entries or pairing bundles.
+    pub fn safety_number(&self, peer: &str) -> Result<Option<String>> {
+        Ok(self
+            .peer_identity(peer)?
+            .map(|key| crate::safety_number(&self.identity.ed25519_public_key(), &key)))
+    }
+
     /// Decline an incoming pairing request. The peer receives `accepted=false`
     /// and any local pending state is discarded.
     pub async fn reject_pairing(&mut self, peer: &str) -> Result<()> {
@@ -416,12 +482,34 @@ impl Engine {
             .create_group(&self.token()?, name, members)
             .await?;
         let key = random_bytes()?;
-        self.store.save_group_key(&group.group_id, &key, unix_time()?)?;
+        let mut roster: Vec<(String, [u8; 32])> = vec![(
+            self.device_id().to_owned(),
+            self.identity.ed25519_public_key(),
+        )];
+        for member in &group.members {
+            if member.device_id == self.device_id {
+                continue;
+            }
+            let ik = self.peer_identity(&member.device_id)?.ok_or_else(|| {
+                EngineError::Protocol("group members must be paired before key distribution".into())
+            })?;
+            roster.push((member.device_id.clone(), ik));
+        }
+        self.store
+            .save_group_key(&group.group_id, &key, unix_time()?, &roster)?;
+        let members: Vec<GroupKeyMember> = roster
+            .iter()
+            .map(|(device_id, ik)| GroupKeyMember {
+                device_id: device_id.clone(),
+                ik_b64: B64.encode(ik),
+            })
+            .collect();
         let body = serde_json::json!({
             "group_id": group.group_id,
             "key_b64": B64.encode(key),
             "version": 1,
             "ts": unix_time()?,
+            "members": members,
         });
         for member in &group.members {
             if member.device_id == self.device_id {
@@ -453,10 +541,13 @@ impl Engine {
                 aad: &aad,
             })
             .map_err(|_| EngineError::Protocol("group encryption failed".into()))?;
+        let signed = group_signed_bytes(group_id, self.device_id(), seq, &nonce[..12], &ciphertext);
+        let signature = self.identity.sign_bytes(&signed);
         let body = serde_json::json!({
             "seq": seq,
             "nonce_b64": B64.encode(&nonce[..12]),
             "ct_b64": B64.encode(ciphertext),
+            "sig_b64": B64.encode(signature),
             "ts": unix_time()?,
         });
         self.api
@@ -882,7 +973,26 @@ impl Engine {
         if key.len() != 32 {
             return Err(EngineError::Protocol("invalid group key length".into()));
         }
-        self.store.save_group_key(&body.group_id, &key, unix_time()?)?;
+        let mut roster: Vec<(String, [u8; 32])> = Vec::with_capacity(body.members.len());
+        for member in &body.members {
+            let ik: [u8; 32] = B64
+                .decode(&member.ik_b64)?
+                .try_into()
+                .map_err(|_| EngineError::Protocol("invalid group member identity".into()))?;
+            if crate::identity::device_id_for_public(&ik) != member.device_id {
+                return Err(EngineError::Protocol(
+                    "group member identity does not match device id".into(),
+                ));
+            }
+            roster.push((member.device_id.clone(), ik));
+        }
+        if !roster.iter().any(|(device_id, _)| device_id == from) {
+            return Err(EngineError::Protocol(
+                "group key envelope does not list its sender".into(),
+            ));
+        }
+        self.store
+            .save_group_key(&body.group_id, &key, unix_time()?, &roster)?;
         Ok(EntryOutcome {
             event: Some(InboxEvent::GroupReady {
                 group_id: body.group_id,
@@ -912,18 +1022,38 @@ impl Engine {
         if body.ts.abs_diff(unix_time()?) > 120 {
             return Err(EngineError::Protocol("stale group message".into()));
         }
-        let cipher = ChaCha20Poly1305::new_from_slice(&key)
-            .map_err(|_| EngineError::Protocol("invalid group key length".into()))?;
         let nonce = B64.decode(&body.nonce_b64)?;
         if nonce.len() != 12 {
             return Err(EngineError::Protocol("invalid group nonce".into()));
         }
+        let ciphertext = B64.decode(&body.ct_b64)?;
+        let signature: [u8; 64] = B64
+            .decode(&body.sig_b64)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| EngineError::Protocol("group message is not signed".into()))?;
+        // Authenticate the claimed sender before touching the ciphertext. The
+        // roster is distributed inside each member's encrypted key envelope;
+        // older groups fall back to the sender's paired session identity.
+        let sender_ik = match self.store.group_member_ik(group_id, &entry.from)? {
+            Some(ik) => Some(ik),
+            None => self.peer_identity(&entry.from)?,
+        }
+        .ok_or_else(|| EngineError::Protocol("group sender is not a known member".into()))?;
+        let signed = group_signed_bytes(group_id, &entry.from, body.seq, &nonce, &ciphertext);
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&sender_ik)
+            .map_err(|_| EngineError::Protocol("invalid group sender identity".into()))?;
+        verifying_key
+            .verify_strict(&signed, &ed25519_dalek::Signature::from_bytes(&signature))
+            .map_err(|_| EngineError::Protocol("group message signature mismatch".into()))?;
+        let cipher = ChaCha20Poly1305::new_from_slice(&key)
+            .map_err(|_| EngineError::Protocol("invalid group key length".into()))?;
         let aad = group_aad(group_id, &entry.from, body.seq);
         let plaintext = cipher
             .decrypt(
                 Nonce::from_slice(&nonce),
                 chacha20poly1305::aead::Payload {
-                    msg: &B64.decode(&body.ct_b64)?,
+                    msg: &ciphertext,
                     aad: &aad,
                 },
             )
@@ -1025,7 +1155,7 @@ impl Engine {
         }
         let ik_pub = decode_array(&envelope.ik_pub)?;
         let ek_pub = decode_array(&envelope.ek_pub)?;
-        let sender_id = hex::encode(&Sha256::digest(ik_pub)[..16]);
+        let sender_id = crate::identity::device_id_for_public(&ik_pub);
         if sender_id != from {
             return Err(EngineError::Protocol(
                 "pair request identity does not match sender".into(),

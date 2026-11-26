@@ -59,8 +59,7 @@ impl Identity {
 
     /// Returns the device ID: lowercase hex of the first 16 bytes of SHA-256(public key).
     pub fn device_id(&self) -> String {
-        let digest = Sha256::digest(self.verifying_key().as_bytes());
-        hex::encode(&digest[..16])
+        device_id_for_public(&self.ed25519_public_key())
     }
 
     pub(crate) fn verifying_key(&self) -> VerifyingKey {
@@ -70,6 +69,16 @@ impl Identity {
     pub(crate) fn signing_key_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
     }
+}
+
+/// Derives the device ID from a raw Ed25519 public key.
+///
+/// The device ID is the first 16 bytes of SHA-256(public key) in lowercase hex,
+/// so every device ID is a 128-bit fingerprint of the identity key. Clients use
+/// this to bind a fetched prekey bundle to the peer they asked for.
+pub fn device_id_for_public(public_key: &[u8; 32]) -> String {
+    let digest = Sha256::digest(public_key);
+    hex::encode(&digest[..16])
 }
 
 #[cfg(test)]

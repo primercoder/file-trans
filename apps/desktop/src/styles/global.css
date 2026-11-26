@@ -234,3 +234,23 @@ input:focus, textarea:focus { border-color: var(--blue-500); box-shadow: 0 0 0 3
 .avatar.group { background: linear-gradient(160deg, #0ea5e9, #2563eb); }
 .check-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .check-row input { width: auto; }
+
+/* Pairing by device id and identity verification */
+.manual-pair { display: flex; gap: 6px; padding: 4px 12px 0; }
+.manual-pair input { font-size: 12px; min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.manual-pair button { flex: none; white-space: nowrap; }
+button.ghost { background: transparent; border: 1px solid var(--line); color: var(--muted); }
+.chat-header .security { margin-left: auto; }
+.device-row { display: flex; flex-direction: column; gap: 4px; }
+.device-row code {
+  font-size: 12px; word-break: break-all; background: var(--blue-50, #eff6ff);
+  border-radius: 8px; padding: 8px 10px;
+}
+.safety-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 15px; letter-spacing: 0.12em; line-height: 1.8;
+  background: var(--blue-50, #eff6ff); border: 1px solid var(--blue-100, #dbeafe);
+  border-radius: 12px; padding: 12px 14px; text-align: center; user-select: all;
+}
+.row-actions { display: flex; gap: 8px; justify-content: flex-end; }

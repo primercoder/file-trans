@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ChatView, DeviceInfo, GroupDto, Peer, Status } from "./types";
+import type { ChatView, DeviceInfo, GroupDto, Peer, PeerSecurity, Status } from "./types";
 
 export const api = {
   status: () => invoke<Status>("status"),
@@ -7,6 +7,7 @@ export const api = {
     invoke<Status>("register", { serverUrl, fingerprint, name }),
   listDevices: () => invoke<DeviceInfo[]>("list_devices"),
   listPeers: () => invoke<Peer[]>("list_peers"),
+  peerSecurity: (peer: string) => invoke<PeerSecurity>("peer_security", { peer }),
   listGroups: () => invoke<GroupDto[]>("list_groups"),
   createGroup: (name: string, members: string[]) => invoke<GroupDto>("create_group", { name, members }),
   sendGroupMessage: (groupId: string, text: string) =>

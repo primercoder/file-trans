@@ -169,6 +169,21 @@ impl Session {
         })
     }
 
+    /// Returns the two Ed25519 identity keys bound into this session, in the
+    /// `(initiator, responder)` order used by the session associated data.
+    ///
+    /// Engines use this to recover the peer identity for safety-number display
+    /// without a separate trust store: the binding is authenticated by every
+    /// message via the AEAD associated data.
+    pub fn identity_binding(&self) -> Option<([u8; 32], [u8; 32])> {
+        let bytes: [u8; 64] = self.session_ad.as_slice().try_into().ok()?;
+        let mut initiator = [0_u8; 32];
+        let mut responder = [0_u8; 32];
+        initiator.copy_from_slice(&bytes[..32]);
+        responder.copy_from_slice(&bytes[32..]);
+        Some((initiator, responder))
+    }
+
     pub fn init_as_responder(
         sk: [u8; 32],
         session_ad: Vec<u8>,

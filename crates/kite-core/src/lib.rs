@@ -7,6 +7,7 @@ mod file_crypto;
 mod identity;
 mod identity_backup;
 mod ratchet;
+mod safety;
 mod store;
 mod x3dh;
 
@@ -19,6 +20,7 @@ pub use file_crypto::{
 };
 pub use identity::Identity;
 pub use ratchet::{RatchetMessage, Session};
+pub use safety::safety_number;
 pub use store::Store;
 pub use x3dh::{CryptoError, InitiatorKeys, PreKeyBundle, ResponderKeys, generate_spk};
 

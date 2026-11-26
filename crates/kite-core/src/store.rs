@@ -121,6 +121,10 @@ impl Store {
              CREATE TABLE IF NOT EXISTS group_keys(
                  group_id TEXT PRIMARY KEY, key BLOB NOT NULL, updated_at INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS group_members(
+                 group_id TEXT NOT NULL, device_id TEXT NOT NULL, ik BLOB NOT NULL,
+                 PRIMARY KEY(group_id, device_id)
+             );
              CREATE TABLE IF NOT EXISTS group_seen(
                  group_id TEXT NOT NULL, sender TEXT NOT NULL, seq INTEGER NOT NULL,
                  PRIMARY KEY(group_id, sender)
@@ -205,13 +209,41 @@ impl Store {
             .optional()?)
     }
 
-    pub fn save_group_key(&self, group_id: &str, key: &[u8], updated_at: i64) -> Result<()> {
-        self.connection.execute(
+    pub fn save_group_key(
+        &self,
+        group_id: &str,
+        key: &[u8],
+        updated_at: i64,
+        members: &[(String, [u8; 32])],
+    ) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
             "INSERT INTO group_keys(group_id,key,updated_at) VALUES(?1,?2,?3)
              ON CONFLICT(group_id) DO UPDATE SET key=excluded.key,updated_at=excluded.updated_at",
             rusqlite::params![group_id, key, updated_at],
         )?;
+        transaction.execute("DELETE FROM group_members WHERE group_id=?1", [group_id])?;
+        for (device_id, ik) in members {
+            transaction.execute(
+                "INSERT INTO group_members(group_id,device_id,ik) VALUES(?1,?2,?3)",
+                rusqlite::params![group_id, device_id, ik.as_slice()],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
+    }
+
+    /// Returns the roster identity key for a group sender, if the roster is known.
+    pub fn group_member_ik(&self, group_id: &str, device_id: &str) -> Result<Option<[u8; 32]>> {
+        let key: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT ik FROM group_members WHERE group_id=?1 AND device_id=?2",
+                [group_id, device_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(key.and_then(|bytes| bytes.try_into().ok()))
     }
 
     pub fn group_key(&self, group_id: &str) -> Result<Option<Vec<u8>>> {

@@ -223,6 +223,82 @@ async fn pairing_messaging_offline_delivery_and_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pairing_sides_agree_on_a_safety_number() {
+    let server = TestServer::spawn();
+    let temp = tempfile::tempdir().unwrap();
+    let mut alice = engine(&temp, "alice", &server);
+    let mut bob = engine(&temp, "bob", &server);
+    alice.register("Alice", "a").await.unwrap();
+    bob.register("Bob", "b").await.unwrap();
+    let bob_id = bob.device_id().to_owned();
+    let alice_id = alice.device_id().to_owned();
+
+    assert!(
+        alice.safety_number(&bob_id).unwrap().is_none(),
+        "unpaired peers have no safety number"
+    );
+
+    alice.start_pairing(&bob_id).await.unwrap();
+    assert!(matches!(
+        bob.poll_once().await.unwrap().as_slice(),
+        [InboxEvent::PairRequest { .. }]
+    ));
+    bob.confirm_pairing(&alice_id).await.unwrap();
+    assert!(matches!(
+        alice.poll_once().await.unwrap().as_slice(),
+        [InboxEvent::PairResponse { accepted: true, .. }]
+    ));
+
+    let alice_code = alice.safety_number(&bob_id).unwrap().expect("code");
+    let bob_code = bob.safety_number(&alice_id).unwrap().expect("code");
+    assert_eq!(alice_code, bob_code);
+    assert_eq!(alice_code.len(), 60);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compromised_server_cannot_substitute_a_peer_bundle() {
+    let server = TestServer::spawn();
+    let temp = tempfile::tempdir().unwrap();
+    let mut alice = engine(&temp, "alice", &server);
+    let mut bob = engine(&temp, "bob", &server);
+    let mut mallory = engine(&temp, "mallory", &server);
+    alice.register("Alice", "a").await.unwrap();
+    bob.register("Bob", "b").await.unwrap();
+    mallory.register("Mallory", "m").await.unwrap();
+    let bob_id = bob.device_id().to_owned();
+    let mallory_id = mallory.device_id().to_owned();
+
+    // A server that controls its database can answer the bundle lookup for Bob's
+    // device id with Mallory's keys. The client must detect the mismatch.
+    let connection = Connection::open(server._temp.path().join("server.db")).unwrap();
+    connection.busy_timeout(Duration::from_secs(2)).unwrap();
+    connection
+        .execute(
+            "UPDATE devices SET
+                 ik_pub=(SELECT ik_pub FROM devices WHERE device_id=?1),
+                 spk=(SELECT spk FROM devices WHERE device_id=?1),
+                 spk_sig=(SELECT spk_sig FROM devices WHERE device_id=?1)
+             WHERE device_id=?2",
+            rusqlite::params![mallory_id, bob_id],
+        )
+        .unwrap();
+    connection
+        .execute("DELETE FROM opk_pool WHERE owner_id=?1", [&bob_id])
+        .unwrap();
+    drop(connection);
+
+    let error = alice.start_pairing(&bob_id).await.unwrap_err();
+    assert!(
+        matches!(&error, kite_core::EngineError::Protocol(message) if message.contains("bundle identity")),
+        "expected bundle identity rejection, got {error:?}"
+    );
+    assert!(
+        alice.paired_peers().unwrap().is_empty(),
+        "a mismatched bundle must not persist a session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn consumed_opk_is_rejected_instead_of_downgrading_to_3dh() {
     let server = TestServer::spawn();
     let temp = tempfile::tempdir().unwrap();

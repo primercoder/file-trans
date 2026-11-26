@@ -42,6 +42,14 @@ struct Peer {
     status: String,
 }
 
+/// Local identity material a user can compare out of band with the peer.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerSecurity {
+    device_id: String,
+    safety_number: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatView {
@@ -223,6 +231,21 @@ async fn list_peers(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<Peer>,
             status,
         })
         .collect())
+}
+
+#[tauri::command]
+async fn peer_security(
+    state: tauri::State<'_, Arc<AppState>>,
+    peer: String,
+) -> Result<PeerSecurity, String> {
+    ensure_engine(&state).await?;
+    let guard = state.engine.lock().await;
+    let engine = guard.as_ref().ok_or("尚未初始化")?;
+    let safety_number = engine.safety_number(&peer).map_err(|error| error.to_string())?;
+    Ok(PeerSecurity {
+        device_id: peer,
+        safety_number,
+    })
 }
 
 #[tauri::command]
@@ -694,6 +717,7 @@ pub fn run() {
             register,
             list_devices,
             list_peers,
+            peer_security,
             list_groups,
             create_group,
             send_group_message,

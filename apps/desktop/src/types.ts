@@ -20,6 +20,11 @@ export interface Peer {
   status: string;
 }
 
+export interface PeerSecurity {
+  deviceId: string;
+  safetyNumber: string | null;
+}
+
 export interface ChatView {
   peer: string;
   direction: "in" | "out" | "system";
