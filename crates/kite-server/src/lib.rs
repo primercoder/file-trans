@@ -31,6 +31,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/send", post(api::mailbox::send))
         .route("/api/v1/sync", get(api::mailbox::sync))
         .route("/api/v1/ack", post(api::mailbox::ack))
+        .route("/api/v1/groups", post(api::groups::create).get(api::groups::list))
+        .route("/api/v1/groups/{group_id}/members", post(api::groups::add_member))
+        .route("/api/v1/groups/{group_id}/send", post(api::groups::send))
         .route("/api/v1/files/init", post(api::files::init))
         .route(
             "/api/v1/files/{upload_id}/chunk/{index}",

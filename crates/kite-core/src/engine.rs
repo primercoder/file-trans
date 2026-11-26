@@ -14,6 +14,7 @@ use argon2::{
     password_hash::{PasswordHasher as _, SaltString, rand_core::OsRng as HashOsRng},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
 use rand::{TryRngCore as _, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -21,6 +22,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{
     ApiClient, BundleDto, ChunkCipher, CryptoError, DeviceInfo, EncryptedChunk, EngineError,
+    api_client::GroupDto,
     FileHeader, FileKey, Identity, IdentityState, InitiatorKeys, PreKeyBundle, RatchetMessage,
     ResponderKeys, Result, Session, Store, encrypt_file, generate_spk,
     store::{EntryOutcome, PendingUpload},
@@ -49,6 +51,34 @@ pub enum InboxEvent {
     FileUnavailable {
         file_id: String,
     },
+    GroupReady {
+        group_id: String,
+    },
+    GroupMessage {
+        group_id: String,
+        from: String,
+        text: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct GroupKeyBody {
+    group_id: String,
+    key_b64: String,
+    version: u8,
+    ts: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GroupMessageBody {
+    seq: i64,
+    nonce_b64: String,
+    ct_b64: String,
+    ts: i64,
+}
+
+fn group_aad(group_id: &str, sender: &str, seq: i64) -> Vec<u8> {
+    format!("kite-group-v1|{group_id}|{sender}|{seq}").into_bytes()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -377,6 +407,91 @@ impl Engine {
         Ok(())
     }
 
+    /// Creates a server-side group and distributes a fresh group key to the
+    /// paired members through their pairwise Double Ratchet sessions. The server
+    /// only ever sees the encrypted key envelope and the ciphertext fan-out.
+    pub async fn create_group(&mut self, name: &str, members: &[String]) -> Result<GroupDto> {
+        let group = self
+            .api
+            .create_group(&self.token()?, name, members)
+            .await?;
+        let key = random_bytes()?;
+        self.store.save_group_key(&group.group_id, &key, unix_time()?)?;
+        let body = serde_json::json!({
+            "group_id": group.group_id,
+            "key_b64": B64.encode(key),
+            "version": 1,
+            "ts": unix_time()?,
+        });
+        for member in &group.members {
+            if member.device_id == self.device_id {
+                continue;
+            }
+            self.send_kind(&member.device_id, "group_key", serde_json::to_vec(&body)?)
+                .await?;
+        }
+        Ok(group)
+    }
+
+    pub async fn groups(&mut self) -> Result<Vec<GroupDto>> {
+        self.api.groups(&self.token()?).await
+    }
+
+    pub async fn send_group_message(&mut self, group_id: &str, text: &str) -> Result<()> {
+        let key = self
+            .store
+            .group_key(group_id)?
+            .ok_or_else(|| EngineError::Protocol("group key is not available".into()))?;
+        let seq = self.store.next_group_seq(group_id)?;
+        let cipher = ChaCha20Poly1305::new_from_slice(&key)
+            .map_err(|_| EngineError::Protocol("invalid group key length".into()))?;
+        let nonce = random_bytes()?;
+        let aad = group_aad(group_id, &self.device_id, seq);
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce[..12]), chacha20poly1305::aead::Payload {
+                msg: text.as_bytes(),
+                aad: &aad,
+            })
+            .map_err(|_| EngineError::Protocol("group encryption failed".into()))?;
+        let body = serde_json::json!({
+            "seq": seq,
+            "nonce_b64": B64.encode(&nonce[..12]),
+            "ct_b64": B64.encode(ciphertext),
+            "ts": unix_time()?,
+        });
+        self.api
+            .send_group(
+                &self.token()?,
+                group_id,
+                B64.encode(serde_json::to_vec(&body)?),
+            )
+            .await
+    }
+
+    async fn send_kind(&mut self, peer: &str, kind: &str, body: Vec<u8>) -> Result<()> {
+        let (state, status) = self
+            .store
+            .session(peer)?
+            .ok_or_else(|| EngineError::Protocol("peer is not paired".into()))?;
+        if status != "paired" {
+            return Err(EngineError::Protocol("pairing has not been accepted".into()));
+        }
+        let mut session: Session = bincode::deserialize(&state)?;
+        let ad = session_ad(&session);
+        let message = session.encrypt(&body, &ad)?;
+        self.api
+            .send(
+                &self.token()?,
+                peer,
+                kind,
+                B64.encode(bincode::serialize(&message)?),
+            )
+            .await?;
+        self.store
+            .save_session(peer, &bincode::serialize(&session)?, "paired")?;
+        Ok(())
+    }
+
     pub async fn send_message(&mut self, peer: &str, text: &str) -> Result<()> {
         let (state, status) = self
             .store
@@ -697,6 +812,8 @@ impl Engine {
             "msg" => self.receive_message(&entry.from, &entry.payload),
             "file" => self.receive_file_offer(&entry.from, &entry.payload),
             "file_evicted" => receive_file_unavailable(&entry.payload),
+            "group_key" => self.receive_group_key(&entry.from, &entry.payload),
+            "group_msg" => self.receive_group_message(entry),
             _ => Ok(EntryOutcome::failed()),
         }
     }
@@ -739,6 +856,88 @@ impl Engine {
             }),
             remove_session: (!response.accepted).then(|| from.to_owned()),
             remove_pending: Some(from.to_owned()),
+            ..EntryOutcome::default()
+        })
+    }
+
+    fn receive_group_key(&self, from: &str, payload: &str) -> Result<EntryOutcome> {
+        let (state, status) = self
+            .store
+            .session(from)?
+            .ok_or_else(|| EngineError::Protocol("group key from unpaired peer".into()))?;
+        if status != "paired" {
+            return Err(EngineError::Protocol(
+                "group key before pairing accepted".into(),
+            ));
+        }
+        let mut session: Session = bincode::deserialize(&state)?;
+        let ad = session_ad(&session);
+        let message: RatchetMessage = decode(payload)?;
+        let plaintext = session.decrypt(&message, &ad)?;
+        let body: GroupKeyBody = serde_json::from_slice(&plaintext)?;
+        if body.version != 1 || body.ts.abs_diff(unix_time()?) > 120 {
+            return Err(EngineError::Protocol("invalid group key envelope".into()));
+        }
+        let key = B64.decode(&body.key_b64)?;
+        if key.len() != 32 {
+            return Err(EngineError::Protocol("invalid group key length".into()));
+        }
+        self.store.save_group_key(&body.group_id, &key, unix_time()?)?;
+        Ok(EntryOutcome {
+            event: Some(InboxEvent::GroupReady {
+                group_id: body.group_id,
+            }),
+            session: Some((
+                from.to_owned(),
+                bincode::serialize(&session)?,
+                "paired".into(),
+            )),
+            ..EntryOutcome::default()
+        })
+    }
+
+    fn receive_group_message(
+        &self,
+        entry: &crate::api_client::MailEntry,
+    ) -> Result<EntryOutcome> {
+        let group_id = entry
+            .group_id
+            .as_deref()
+            .ok_or_else(|| EngineError::Protocol("group message without group id".into()))?;
+        let key = self
+            .store
+            .group_key(group_id)?
+            .ok_or_else(|| EngineError::Protocol("group key is not available".into()))?;
+        let body: GroupMessageBody = serde_json::from_slice(&B64.decode(&entry.payload)?)?;
+        if body.ts.abs_diff(unix_time()?) > 120 {
+            return Err(EngineError::Protocol("stale group message".into()));
+        }
+        let cipher = ChaCha20Poly1305::new_from_slice(&key)
+            .map_err(|_| EngineError::Protocol("invalid group key length".into()))?;
+        let nonce = B64.decode(&body.nonce_b64)?;
+        if nonce.len() != 12 {
+            return Err(EngineError::Protocol("invalid group nonce".into()));
+        }
+        let aad = group_aad(group_id, &entry.from, body.seq);
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: &B64.decode(&body.ct_b64)?,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| EngineError::Protocol("group message authentication failed".into()))?;
+        let text = String::from_utf8(plaintext)?;
+        if !self.store.accept_group_seq(group_id, &entry.from, body.seq)? {
+            return Ok(EntryOutcome::default());
+        }
+        Ok(EntryOutcome {
+            event: Some(InboxEvent::GroupMessage {
+                group_id: group_id.to_owned(),
+                from: entry.from.clone(),
+                text,
+            }),
             ..EntryOutcome::default()
         })
     }

@@ -11,6 +11,7 @@ pub mod auth;
 pub mod bundles;
 pub mod directory;
 pub mod files;
+pub mod groups;
 pub mod mailbox;
 pub mod pairing;
 pub mod stats;

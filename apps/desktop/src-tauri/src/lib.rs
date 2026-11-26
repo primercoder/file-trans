@@ -3,7 +3,7 @@ mod settings;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chatlog::{ChatLog, ChatRecord};
-use kite_core::{Engine, InboxEvent};
+use kite_core::{Engine, GroupDto, InboxEvent};
 use serde::Serialize;
 use settings::Settings;
 use std::path::{Path, PathBuf};
@@ -223,6 +223,53 @@ async fn list_peers(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<Peer>,
             status,
         })
         .collect())
+}
+
+#[tauri::command]
+async fn list_groups(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<GroupDto>, String> {
+    with_engine(&state, |engine| Box::pin(async move { engine.groups().await })).await
+}
+
+#[tauri::command]
+async fn create_group(
+    state: tauri::State<'_, Arc<AppState>>,
+    name: String,
+    members: Vec<String>,
+) -> Result<GroupDto, String> {
+    with_engine(&state, |engine| {
+        let name = name.clone();
+        let members = members.clone();
+        Box::pin(async move { engine.create_group(&name, &members).await })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn send_group_message(
+    state: tauri::State<'_, Arc<AppState>>,
+    group_id: String,
+    text: String,
+) -> Result<(), String> {
+    let text = text.trim().to_owned();
+    if text.is_empty() {
+        return Err("消息不能为空".into());
+    }
+    with_engine(&state, |engine| {
+        let (group_id, text) = (group_id.clone(), text.clone());
+        Box::pin(async move { engine.send_group_message(&group_id, &text).await })
+    })
+    .await?;
+    state.chat.append(&ChatRecord {
+        peer: group_id,
+        direction: "out".into(),
+        kind: "text".into(),
+        text,
+        file_id: None,
+        file_name: None,
+        size: None,
+        ts: now(),
+    })?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -452,6 +499,52 @@ async fn poll(
                 size: None,
                 ts: now(),
             },
+            InboxEvent::GroupReady { group_id } => {
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("Kite 群组")
+                    .body("已收到群组密钥")
+                    .show();
+                ChatView {
+                    peer: group_id.clone(),
+                    direction: "system".into(),
+                    kind: "group_ready".into(),
+                    text: "已加入群组".into(),
+                    file_id: None,
+                    file_name: None,
+                    size: None,
+                    ts: now(),
+                }
+            }
+            InboxEvent::GroupMessage { group_id, from, text } => {
+                state.chat.append(&ChatRecord {
+                    peer: group_id.clone(),
+                    direction: "in".into(),
+                    kind: "text".into(),
+                    text: text.clone(),
+                    file_id: None,
+                    file_name: None,
+                    size: None,
+                    ts: now(),
+                })?;
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("Kite 群消息")
+                    .body(&text)
+                    .show();
+                ChatView {
+                    peer: group_id,
+                    direction: "in".into(),
+                    kind: "text".into(),
+                    text,
+                    file_id: None,
+                    file_name: None,
+                    size: None,
+                    ts: now(),
+                }
+            }
             InboxEvent::PairResponse { from, accepted } => ChatView {
                 peer: from,
                 direction: "system".into(),
@@ -600,6 +693,9 @@ pub fn run() {
             register,
             list_devices,
             list_peers,
+            list_groups,
+            create_group,
+            send_group_message,
             pair,
             confirm_pair,
             reject_pair,

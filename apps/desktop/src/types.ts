@@ -30,3 +30,16 @@ export interface ChatView {
   size: number | null;
   ts: number;
 }
+
+export interface GroupMember {
+  device_id: string;
+  name: string;
+  role: string;
+}
+
+export interface GroupDto {
+  group_id: string;
+  name: string;
+  owner: string;
+  members: GroupMember[];
+}

@@ -10,7 +10,7 @@ mod ratchet;
 mod store;
 mod x3dh;
 
-pub use api_client::ApiClient;
+pub use api_client::{ApiClient, GroupDto};
 pub use device_name::HwInfo;
 pub use engine::InboxEvent;
 pub use file_crypto::{

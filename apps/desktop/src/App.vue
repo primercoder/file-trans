@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api, formatSize, shortId } from "./api";
-import type { ChatView, DeviceInfo, Peer, Status } from "./types";
+import type { ChatView, DeviceInfo, GroupDto, Peer, Status } from "./types";
 import Onboarding from "./components/Onboarding.vue";
 import MessageItem from "./components/MessageItem.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
@@ -12,6 +12,7 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 const status = ref<Status | null>(null);
 const peers = ref<Peer[]>([]);
 const devices = ref<DeviceInfo[]>([]);
+const groups = ref<GroupDto[]>([]);
 const activePeer = ref<string | null>(null);
 const messages = ref<ChatView[]>([]);
 const input = ref("");
@@ -20,6 +21,9 @@ const toast = ref("");
 const showSettings = ref(false);
 const dragOver = ref(false);
 const isMobile = ref(false);
+const showCreateGroup = ref(false);
+const groupName = ref("");
+const groupMembers = ref<string[]>([]);
 let timer: number | undefined;
 
 const deviceNames = computed(() => {
@@ -32,8 +36,12 @@ const pairedIds = computed(() => new Set(peers.value.map((peer) => peer.deviceId
 const discoverable = computed(() =>
   devices.value.filter((device) => !pairedIds.value.has(device.device_id) && device.device_id !== status.value?.deviceId),
 );
+const activeGroup = computed(() =>
+  groups.value.find((group) => group.group_id === activePeer.value) ?? null,
+);
 const activePeerName = computed(() => {
   if (!activePeer.value) return "";
+  if (activeGroup.value) return activeGroup.value.name;
   return deviceNames.value[activePeer.value] || `设备 ${shortId(activePeer.value)}`;
 });
 const pendingRequests = computed(() =>
@@ -62,6 +70,7 @@ async function refreshStatus() {
 async function refreshLists() {
   try {
     peers.value = await api.listPeers();
+    groups.value = await api.listGroups().catch(() => []);
     const deviceList = await api.listDevices();
     devices.value = deviceList;
     if (!activePeer.value) {
@@ -140,7 +149,11 @@ async function send() {
   if (!text || !activePeer.value) return;
   busy.value = true;
   try {
-    await api.sendMessage(activePeer.value, text);
+    if (activeGroup.value) {
+      await api.sendGroupMessage(activePeer.value, text);
+    } else {
+      await api.sendMessage(activePeer.value, text);
+    }
     input.value = "";
     messages.value = await api.history(activePeer.value);
   } catch (error) {
@@ -167,6 +180,32 @@ async function sendPath(path: string) {
     showToast(String(error));
   } finally {
     busy.value = false;
+  }
+}
+
+function toggleGroupMember(id: string) {
+  if (groupMembers.value.includes(id)) {
+    groupMembers.value = groupMembers.value.filter((member) => member !== id);
+  } else {
+    groupMembers.value = [...groupMembers.value, id];
+  }
+}
+
+async function submitGroup() {
+  if (!groupName.value.trim() || !groupMembers.value.length) {
+    showToast("请填写群组名称并选择成员");
+    return;
+  }
+  try {
+    const group = await api.createGroup(groupName.value.trim(), groupMembers.value);
+    groups.value = [group, ...groups.value];
+    showCreateGroup.value = false;
+    groupName.value = "";
+    groupMembers.value = [];
+    await selectPeer(group.group_id);
+    showToast("群组已创建，密钥已分发");
+  } catch (error) {
+    showToast(String(error));
   }
 }
 
@@ -250,6 +289,25 @@ watch(activePeer, (peer) => {
         </span>
       </button>
 
+      <div class="section-title">
+        <span>群组</span>
+        <button class="tiny" @click="showCreateGroup = true">＋</button>
+      </div>
+      <div v-if="!groups.length" class="muted small pad">还没有群组</div>
+      <button
+        v-for="group in groups"
+        :key="group.group_id"
+        class="peer"
+        :class="{ active: group.group_id === activePeer }"
+        @click="selectPeer(group.group_id)"
+      >
+        <span class="avatar group">{{ group.name.slice(0, 1) }}</span>
+        <span class="peer-info">
+          <strong>{{ group.name }}</strong>
+          <span class="muted small">{{ group.members.length }} 位成员</span>
+        </span>
+      </button>
+
       <div class="section-title">发现设备</div>
       <div v-if="!discoverable.length" class="muted small pad">暂无其他设备</div>
       <div v-for="device in discoverable" :key="device.device_id" class="peer">
@@ -309,6 +367,28 @@ watch(activePeer, (peer) => {
       <div>松开鼠标，将文件发送给 {{ activePeerName || "对方" }}</div>
     </div>
     <div v-if="toast" class="toast">{{ toast }}</div>
+    <div v-if="showCreateGroup" class="modal-mask" @click.self="showCreateGroup = false">
+      <div class="modal">
+        <header>
+          <h2>创建群组</h2>
+          <button class="icon" @click="showCreateGroup = false">×</button>
+        </header>
+        <section>
+          <input v-model="groupName" placeholder="群组名称" />
+          <p class="muted small">选择已配对成员（群密钥将经各自的加密会话分发）</p>
+          <div v-if="!peers.length" class="muted small">还没有已配对设备</div>
+          <label v-for="peer in peers" :key="peer.deviceId" class="check-row">
+            <input
+              type="checkbox"
+              :checked="groupMembers.includes(peer.deviceId)"
+              @change="toggleGroupMember(peer.deviceId)"
+            />
+            <span>{{ deviceNames[peer.deviceId] || shortId(peer.deviceId) }}</span>
+          </label>
+          <button class="primary" @click="submitGroup">创建并分发密钥</button>
+        </section>
+      </div>
+    </div>
     <SettingsPanel
       v-if="showSettings"
       :status="status"

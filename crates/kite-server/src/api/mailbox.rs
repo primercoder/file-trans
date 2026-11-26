@@ -36,10 +36,14 @@ pub struct Entry {
     pub kind: String,
     pub payload: String,
     pub ts: i64,
+    pub group_id: Option<String>,
 }
 
 /// Persists an entry and assigns its owner-local sequence in the same transaction.
 /// Notification happens only after commit, so every wakeup observes durable data.
+/// The parameter list is flat on purpose: every caller passes routing metadata
+/// explicitly, and a struct would obscure which hints apply to which kind.
+#[allow(clippy::too_many_arguments)]
 pub async fn enqueue(
     state: &AppState,
     from: String,
@@ -48,6 +52,7 @@ pub async fn enqueue(
     encoded_payload: &str,
     ts: i64,
     file_hint: Option<&str>,
+    group_hint: Option<&str>,
 ) -> Result<i64, ApiError> {
     if kind == "file_evicted" {
         return Err(ApiError::new(
@@ -96,8 +101,9 @@ pub async fn enqueue(
             params![to, seq],
         )?;
         transaction.execute(
-            "INSERT INTO mailboxes(owner_id,seq,from_id,kind,payload,ts) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![to, seq, from, kind, payload, ts],
+            "INSERT INTO mailboxes(owner_id,seq,from_id,kind,payload,ts,group_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![to, seq, from, kind, payload, ts, group_hint],
         )?;
         if kind == "file" {
             let encoded = file_hint.ok_or_else(|| ApiError::invalid("file_hint is required"))?;
@@ -164,6 +170,7 @@ pub async fn send(
         &request.payload,
         request.ts,
         request.file_hint.as_deref(),
+        None,
     )
     .await?;
     Ok(Json(json!({"seq": seq})))
@@ -199,7 +206,7 @@ pub async fn sync(
 async fn read_entries(state: &AppState, owner: &str, since: i64) -> Result<Vec<Entry>, ApiError> {
     let connection = state.db.0.lock().await;
     let mut statement = connection.prepare(
-        "SELECT seq,from_id,kind,payload,ts FROM mailboxes
+        "SELECT seq,from_id,kind,payload,ts,group_id FROM mailboxes
          WHERE owner_id = ?1 AND seq > ?2 ORDER BY seq ASC",
     )?;
     let rows = statement.query_map(params![owner, since], |row| {
@@ -209,6 +216,7 @@ async fn read_entries(state: &AppState, owner: &str, since: i64) -> Result<Vec<E
             kind: row.get(2)?,
             payload: B64.encode(row.get::<_, Vec<u8>>(3)?),
             ts: row.get(4)?,
+            group_id: row.get(5)?,
         })
     })?;
     let mut entries = Vec::new();

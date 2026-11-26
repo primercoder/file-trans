@@ -7,7 +7,7 @@ use rustls::{
     crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -96,6 +96,23 @@ pub struct MailEntry {
     pub from: String,
     pub kind: String,
     pub payload: String,
+    #[serde(default)]
+    pub group_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub device_id: String,
+    pub name: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupDto {
+    pub group_id: String,
+    pub name: String,
+    pub owner: String,
+    pub members: Vec<GroupMember>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,6 +389,44 @@ impl ApiClient {
             .post(format!("{}{}", self.base_url, path))
             .bearer_auth(token)
             .json(&json!({"to": to, "accept": accept, "payload": payload}))
+            .send()
+            .await?;
+        self.json::<Value>(response).await?;
+        Ok(())
+    }
+
+    pub async fn create_group(
+        &self,
+        token: &str,
+        name: &str,
+        members: &[String],
+    ) -> Result<GroupDto> {
+        let response = self
+            .client
+            .post(format!("{}/api/v1/groups", self.base_url))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"name": name, "members": members}))
+            .send()
+            .await?;
+        self.json(response).await
+    }
+
+    pub async fn groups(&self, token: &str) -> Result<Vec<GroupDto>> {
+        let response = self
+            .client
+            .get(format!("{}/api/v1/groups", self.base_url))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        self.json(response).await
+    }
+
+    pub async fn send_group(&self, token: &str, group_id: &str, payload: String) -> Result<()> {
+        let response = self
+            .client
+            .post(format!("{}/api/v1/groups/{group_id}/send", self.base_url))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"payload": payload, "ts": unix_time()?}))
             .send()
             .await?;
         self.json::<Value>(response).await?;

@@ -117,6 +117,16 @@ impl Store {
                  content_hash BLOB PRIMARY KEY, upload_id TEXT UNIQUE, file_id TEXT UNIQUE,
                  peer TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL,
                  fk BLOB NOT NULL, header BLOB NOT NULL, created_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS group_keys(
+                 group_id TEXT PRIMARY KEY, key BLOB NOT NULL, updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS group_seen(
+                 group_id TEXT NOT NULL, sender TEXT NOT NULL, seq INTEGER NOT NULL,
+                 PRIMARY KEY(group_id, sender)
+             );
+             CREATE TABLE IF NOT EXISTS group_out_seq(
+                 group_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL
              );",
         )?;
         Ok(Self { connection })
@@ -193,6 +203,64 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?)
+    }
+
+    pub fn save_group_key(&self, group_id: &str, key: &[u8], updated_at: i64) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO group_keys(group_id,key,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(group_id) DO UPDATE SET key=excluded.key,updated_at=excluded.updated_at",
+            rusqlite::params![group_id, key, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn group_key(&self, group_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .connection
+            .query_row("SELECT key FROM group_keys WHERE group_id=?1", [group_id], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Returns true when `seq` is newer than the last accepted message from
+    /// this sender in this group, and records it as the new high-water mark.
+    pub fn accept_group_seq(&self, group_id: &str, sender: &str, seq: i64) -> Result<bool> {
+        let previous: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT seq FROM group_seen WHERE group_id=?1 AND sender=?2",
+                rusqlite::params![group_id, sender],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.is_some_and(|previous| seq <= previous) {
+            return Ok(false);
+        }
+        self.connection.execute(
+            "INSERT INTO group_seen(group_id,sender,seq) VALUES(?1,?2,?3)
+             ON CONFLICT(group_id,sender) DO UPDATE SET seq=excluded.seq",
+            rusqlite::params![group_id, sender, seq],
+        )?;
+        Ok(true)
+    }
+
+    pub fn next_group_seq(&self, group_id: &str) -> Result<i64> {
+        let next: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(next_seq,0)+1 FROM group_out_seq WHERE group_id=?1",
+                [group_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(1);
+        self.connection.execute(
+            "INSERT INTO group_out_seq(group_id,next_seq) VALUES(?1,?2)
+             ON CONFLICT(group_id) DO UPDATE SET next_seq=excluded.next_seq",
+            rusqlite::params![group_id, next],
+        )?;
+        Ok(next)
     }
 
     /// All known sessions with their pairing status, for UI peer lists.

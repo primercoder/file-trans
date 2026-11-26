@@ -225,3 +225,12 @@ input:focus, textarea:focus { border-color: var(--blue-500); box-shadow: 0 0 0 3
   .bubble { max-width: 86%; }
   .composer { padding: 10px 12px 14px; }
 }
+
+.section-title { display: flex; align-items: center; justify-content: space-between; }
+.section-title .tiny {
+  border: none; background: transparent; color: var(--blue-600);
+  font-size: 16px; line-height: 1; padding: 0 10px 0 0;
+}
+.avatar.group { background: linear-gradient(160deg, #0ea5e9, #2563eb); }
+.check-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.check-row input { width: auto; }

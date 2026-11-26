@@ -86,8 +86,28 @@ impl Db {
                  file_id TEXT PRIMARY KEY,
                  dir TEXT NOT NULL,
                  created_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS groups (
+                 group_id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 owner TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS group_members (
+                 group_id TEXT NOT NULL,
+                 device_id TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 PRIMARY KEY(group_id, device_id)
              );",
         )?;
+        // M5: group fan-out keeps the group id as routing metadata (payload stays ciphertext).
+        let group_column = connection
+            .prepare("PRAGMA table_info(mailboxes)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|column| column.is_ok_and(|name| name == "group_id"));
+        if !group_column {
+            connection.execute("ALTER TABLE mailboxes ADD COLUMN group_id TEXT", [])?;
+        }
         // M2: track received ciphertext independently from the declared reservation.
         let actual_bytes_column = connection
             .prepare("PRAGMA table_info(files)")?
