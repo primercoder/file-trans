@@ -28,3 +28,7 @@ apps/desktop/src-tauri/gen/android/app/build/
 dist/
 *.keystore
 apps/desktop/src-tauri/gen/android/keystore.properties
+fingerprint.txt
+kite.db
+kite.db-shm
+kite.db-wal
