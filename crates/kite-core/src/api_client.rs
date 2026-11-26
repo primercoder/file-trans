@@ -134,13 +134,15 @@ pub struct FileMetadata {
 
 impl ApiClient {
     pub fn new(base_url: &str, server_fingerprint: &str) -> Result<Self> {
+        // reqwest builds its own rustls config from the process default provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let fingerprint: [u8; 32] = hex::decode(server_fingerprint.trim())
             .map_err(|error| EngineError::Configuration(error.to_string()))?
             .try_into()
             .map_err(|_| EngineError::Configuration("fingerprint must be SHA-256 hex".into()))?;
         let provider = CryptoProvider::get_default()
             .cloned()
-            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+            .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
         let tls = ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|error| EngineError::Configuration(error.to_string()))?

@@ -20,7 +20,7 @@ trap cleanup EXIT
 
 mkdir -p "$(dirname "$LOG")"
 echo "DEPLOY_START host=$HOST source=$ROOT log=$LOG"
-tar --exclude='./target' --exclude='./.git' --exclude='./.superpowers' \
+tar --exclude='./target' --exclude='./.git' --exclude='./.superpowers' --exclude='./dist' \
     --exclude='./apps/desktop/node_modules' --exclude='./apps/desktop/src-tauri/target' \
     --exclude='*.db' --exclude='*.db-*' --exclude='*.log' \
     -C "$ROOT" -cf "$ARCHIVE" .

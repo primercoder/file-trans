@@ -22,6 +22,7 @@ struct Server {
 }
 
 fn client() -> reqwest::Client {
+    kite_server::ensure_crypto_provider();
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()

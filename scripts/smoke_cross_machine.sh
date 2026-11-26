@@ -84,7 +84,7 @@ curl --noproxy '*' -fsS "http://127.0.0.1:$HEALTH_PORT/healthz" >"$WORK_DIR/heal
 echo "SERVER_OK bind=0.0.0.0:$API_PORT fingerprint=$fingerprint"
 
 # Ship exactly the tested source (not target/, VCS metadata, or local databases).
-tar --exclude='./target' --exclude='./.git' --exclude='./.superpowers' \
+tar --exclude='./target' --exclude='./.git' --exclude='./.superpowers' --exclude='./dist' \
     --exclude='./apps/desktop/node_modules' --exclude='./apps/desktop/src-tauri/target' \
     --exclude='./apps/desktop/src-tauri/gen/android/app/build' \
     --exclude='./apps/desktop/src-tauri/gen/android/build' \

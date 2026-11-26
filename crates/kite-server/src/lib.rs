@@ -62,7 +62,13 @@ pub fn health_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Installs the process-wide rustls provider used by reqwest and axum-server.
+pub fn ensure_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 pub async fn router_with_db(path: &Path) -> Result<Router, Box<dyn std::error::Error>> {
+    ensure_crypto_provider();
     Ok(router(AppState::new(Db::open(path)?)))
 }
 
