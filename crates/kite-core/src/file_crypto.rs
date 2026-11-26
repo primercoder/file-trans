@@ -81,6 +81,61 @@ pub enum FileCryptoError {
 /// Encrypt all bytes from `reader`, splitting at `chunk_size` bytes.
 ///
 /// No filename or other envelope metadata is included in the header.
+/// Encrypts an in-memory slice chunk by chunk without copying plaintext.
+///
+/// The AAD binds `total_chunks`, so the caller must supply the full input (the
+/// engine already holds the file bytes from the UI layer). This is the hot path
+/// for outgoing files: peak memory is ciphertext + caller input, not both
+/// plaintext and ciphertext copies.
+pub fn encrypt_bytes(
+    fk: &FileKey,
+    bytes: &[u8],
+    chunk_size: usize,
+) -> Result<(FileHeader, Vec<EncryptedChunk>), FileCryptoError> {
+    if chunk_size == 0 || chunk_size > u32::MAX as usize {
+        return Err(FileCryptoError::BadHeader(
+            "chunk_size must fit in a nonzero u32".into(),
+        ));
+    }
+    let total_chunks = u32::try_from(bytes.len().div_ceil(chunk_size))
+        .map_err(|_| FileCryptoError::BadHeader("too many chunks".into()))?;
+    if total_chunks == 0 {
+        return Err(FileCryptoError::BadHeader(
+            "empty files cannot be encrypted".into(),
+        ));
+    }
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&fk.0));
+    let mut hasher = Sha256::new();
+    let mut chunks = Vec::with_capacity(total_chunks as usize);
+    for (offset, plaintext) in bytes.chunks(chunk_size).enumerate() {
+        let index = u32::try_from(offset)
+            .map_err(|_| FileCryptoError::BadHeader("too many chunks".into()))?;
+        let aad = aad(index, total_chunks, chunk_size as u32);
+        let nonce = nonce(fk, index);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| FileCryptoError::MacFailure { index })?;
+        hasher.update(&ciphertext);
+        chunks.push(EncryptedChunk { index, ciphertext });
+    }
+    Ok((
+        FileHeader {
+            magic: MAGIC,
+            version: VERSION,
+            total_chunks,
+            chunk_size: chunk_size as u32,
+            content_hash: hasher.finalize().into(),
+        },
+        chunks,
+    ))
+}
+
 pub fn encrypt_file(
     fk: &FileKey,
     mut reader: impl Read,

@@ -113,3 +113,33 @@ fn fixed_two_chunk_known_answer() {
         "8f45be551e73770c3214e8054fe1f912c0821115f35bb2edc9e86f59e7cd2a53"
     );
 }
+
+
+#[test]
+fn encrypt_bytes_matches_reader_and_random_keys_differ() {
+    let fk = kite_core::FileKey::from_bytes([9_u8; 32]);
+    let payload = vec![0x5a_u8; 600 * 1024 + 17];
+    let (header_a, chunks_a) = kite_core::encrypt_bytes(&fk, &payload, 256 * 1024 - 16).unwrap();
+    let (header_b, chunks_b) =
+        kite_core::encrypt_file(&fk, payload.as_slice(), 256 * 1024 - 16).unwrap();
+    assert_eq!(header_a, header_b);
+    assert_eq!(chunks_a, chunks_b);
+
+    // A fresh random file key must never reproduce the same ciphertext.
+    let other = kite_core::FileKey::generate().unwrap();
+    let (_, chunks_c) = kite_core::encrypt_bytes(&other, &payload, 256 * 1024 - 16).unwrap();
+    assert_ne!(chunks_a[0].ciphertext, chunks_c[0].ciphertext);
+}
+
+#[test]
+fn large_file_roundtrip_stays_exact() {
+    let fk = kite_core::FileKey::generate().unwrap();
+    let payload: Vec<u8> = (0..(8 * 1024 * 1024)).map(|index| (index % 251) as u8).collect();
+    let (header, chunks) = kite_core::encrypt_bytes(&fk, &payload, 256 * 1024 - 16).unwrap();
+    let mut cipher = kite_core::ChunkCipher::new(&fk, header).unwrap();
+    let mut restored = Vec::new();
+    for chunk in chunks.into_iter().rev() {
+        restored.extend(cipher.push_chunk(chunk).unwrap());
+    }
+    assert_eq!(restored, payload);
+}

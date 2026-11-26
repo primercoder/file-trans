@@ -24,7 +24,7 @@ use crate::{
     ApiClient, BundleDto, ChunkCipher, CryptoError, DeviceInfo, EncryptedChunk, EngineError,
     api_client::GroupDto,
     FileHeader, FileKey, Identity, IdentityState, InitiatorKeys, PreKeyBundle, RatchetMessage,
-    ResponderKeys, Result, Session, Store, encrypt_file, generate_spk,
+    ResponderKeys, Result, Session, Store, encrypt_bytes, generate_spk,
     store::{EntryOutcome, PendingUpload},
 };
 
@@ -555,7 +555,7 @@ impl Engine {
             // Re-encryption is deterministic: each nonce derives from fk+index and
             // AAD from index+total_chunks+chunk_size. The stored key therefore
             // reproduces exactly the ciphertext already accepted by the server.
-            let (header, chunks) = encrypt_file(&fk, bytes, stored_header.chunk_size as usize)?;
+            let (header, chunks) = encrypt_bytes(&fk, bytes, stored_header.chunk_size as usize)?;
             if header != stored_header
                 || upload.size != bytes.len() as u64
                 || upload.peer != peer
@@ -569,7 +569,7 @@ impl Engine {
         } else {
             let fk = FileKey::generate()?;
             // Leave room for each chunk's AEAD tag under the server's 256 KiB limit.
-            let (header, chunks) = encrypt_file(&fk, bytes, 256 * 1024 - 16)?;
+            let (header, chunks) = encrypt_bytes(&fk, bytes, 256 * 1024 - 16)?;
             // Intent, including key material, is durable before the first network
             // mutation. The server IDs are bound immediately after init returns.
             self.store.save_pending_upload(
@@ -653,7 +653,7 @@ impl Engine {
         }
         let fk = FileKey::from_bytes(pending.fk);
         let header: FileHeader = bincode::deserialize(&pending.header)?;
-        let (regenerated, chunks) = encrypt_file(&fk, bytes, header.chunk_size as usize)?;
+        let (regenerated, chunks) = encrypt_bytes(&fk, bytes, header.chunk_size as usize)?;
         if regenerated != header {
             return Err(EngineError::Protocol(
                 "plaintext does not reproduce pending upload".into(),

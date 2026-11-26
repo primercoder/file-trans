@@ -14,7 +14,8 @@ pub use api_client::{ApiClient, GroupDto};
 pub use device_name::HwInfo;
 pub use engine::InboxEvent;
 pub use file_crypto::{
-    ChunkCipher, EncryptedChunk, FileCryptoError, FileHeader, FileKey, decrypt_file, encrypt_file,
+    ChunkCipher, EncryptedChunk, FileCryptoError, FileHeader, FileKey, decrypt_file, encrypt_bytes,
+    encrypt_file,
 };
 pub use identity::Identity;
 pub use ratchet::{RatchetMessage, Session};
