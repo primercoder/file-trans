@@ -53,6 +53,7 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const conversations = ref<Record<string, Conversation>>({});
 const pendingShare = ref<SharePayload | null>(null);
 const shareBusy = ref(false);
+let checkingShare = false;
 const lastRead = ref<Record<string, number>>({});
 const nameCache = ref<Record<string, string>>({});
 
@@ -632,12 +633,33 @@ function openAddAccount() {
 }
 
 async function checkShare() {
-  if (!status.value?.registered) return;
+  if (!status.value?.registered || pendingShare.value || shareBusy.value || checkingShare) return;
+  checkingShare = true;
   try {
     const share = await api.takeShare();
     if (share) pendingShare.value = share;
   } catch (error) {
     console.warn("share check failed", error);
+  } finally {
+    checkingShare = false;
+  }
+}
+
+async function finishShare(share: SharePayload) {
+  if (share.batch) await api.finishShare(share.batch);
+  pendingShare.value = null;
+}
+
+async function dismissShare() {
+  if (!pendingShare.value || shareBusy.value) return;
+  shareBusy.value = true;
+  try {
+    await finishShare(pendingShare.value);
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    shareBusy.value = false;
+    void checkShare();
   }
 }
 
@@ -652,22 +674,26 @@ async function sendShare(target: string) {
   shareBusy.value = true;
   try {
     if (!group) {
-      for (const file of share.files) {
-        await api.sendFile(target, file.path);
+      while (share.files.length) {
+        const [file] = share.files;
+        await api.sendFile(target, file.path, file.name);
+        share.files.shift();
       }
     }
     if (share.text?.trim()) {
       const text = share.text.trim();
       if (group) await api.sendGroupMessage(target, text);
       else await api.sendMessage(target, text);
+      share.text = null;
     }
-    pendingShare.value = null;
+    await finishShare(share);
     await refreshLists();
     await select(target);
   } catch (error) {
     showToast(String(error));
   } finally {
     shareBusy.value = false;
+    void checkShare();
   }
 }
 
@@ -873,11 +899,11 @@ onBeforeUnmount(() => {
     <div v-if="dragOver" class="drop-overlay">{{ t("chat.attach") }}</div>
     <div v-if="toast" class="toast">{{ toast }}</div>
 
-    <div v-if="pendingShare" class="sheet-mask" @click.self="pendingShare = null">
+    <div v-if="pendingShare" class="sheet-mask" @click.self="dismissShare">
       <div class="sheet">
         <header class="sheet-header">
           <h2>{{ t("share.title") }}</h2>
-          <button class="icon" @click="pendingShare = null">×</button>
+          <button class="icon" :disabled="shareBusy" @click="dismissShare">×</button>
         </header>
         <section class="sheet-section">
           <p class="muted small">

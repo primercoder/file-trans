@@ -27,6 +27,7 @@ export const api = {
   conversations: () => invoke<Conversation[]>("conversations"),
   removeContact: (peer: string) => invoke<void>("remove_contact", { peer }),
   takeShare: () => invoke<SharePayload | null>("take_share"),
+  finishShare: (batch: string) => invoke<void>("finish_share", { batch }),
   peerSecurity: (peer: string) => invoke<PeerSecurity>("peer_security", { peer }),
   unpair: (peer: string) => invoke<void>("unpair", { peer }),
   listGroups: () => invoke<GroupDto[]>("list_groups"),
@@ -37,7 +38,7 @@ export const api = {
   confirmPair: (peer: string) => invoke<void>("confirm_pair", { peer }),
   rejectPair: (peer: string) => invoke<void>("reject_pair", { peer }),
   sendMessage: (peer: string, text: string) => invoke<void>("send_message", { peer, text }),
-  sendFile: (peer: string, path: string) => invoke<string>("send_file", { peer, path }),
+  sendFile: (peer: string, path: string, name?: string) => invoke<string>("send_file", { peer, path, name }),
   sendFileData: (peer: string, name: string, data: string) =>
     invoke<string>("send_file_data", { peer, name, data }),
   downloadFile: (fileId: string) => invoke<string>("download_file", { fileId }),

@@ -59,6 +59,7 @@ export interface ShareFile {
 }
 
 export interface SharePayload {
+  batch: string | null;
   text: string | null;
   files: ShareFile[];
 }

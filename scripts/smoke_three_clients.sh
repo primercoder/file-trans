@@ -1,47 +1,46 @@
 #!/usr/bin/env bash
-# State contract: Compose is always stopped on exit (without -v, so docker/data
-# and its database/fingerprint survive for inspection and later runs). Temporary
-# client state is deleted. On failure, full server logs are preserved under
-# /tmp/opencode and the last 50 lines are printed before cleanup.
+# Use an isolated Compose project, database and host port for each run.
+# Preserve server logs and data on failure.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT/docker/docker-compose.yml"
-DATA_DIR="$ROOT/docker/data"
-BASE_URL="https://localhost:8443"
 RUN_ID="$(date +%s%N)-$$"
-ALICE_NAME="Alice-$RUN_ID"
-BOB_NAME="Bob-$RUN_ID"
-MESSAGE="three-endpoint smoke: hello from A"
-WORK_DIR="$(mktemp -d /tmp/opencode/kite-smoke.XXXXXX)"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/kite-smoke.XXXXXX)"
+export KITE_DATA_DIR="$WORK_DIR/data"
+export KITE_PUBLISH_PORT=0
+export KITE_CONTAINER_USER="$(id -u):$(id -g)"
+compose=(docker compose -f "$COMPOSE_FILE" -p "kite-smoke-$RUN_ID")
 cleanup() {
     status=$?
     trap - EXIT
     if [[ "$status" -ne 0 ]]; then
-        log_dir="/tmp/opencode/kite-smoke-failure-$RUN_ID"
-        mkdir -p "$log_dir"
-        docker compose -f "$COMPOSE_FILE" logs --no-color kite-server \
-            >"$log_dir/server.log" 2>&1 || true
-        echo "FAIL: full server log preserved at $log_dir/server.log" >&2
-        tail -n 50 "$log_dir/server.log" >&2
+        "${compose[@]}" logs --no-color kite-server >"$WORK_DIR/server.log" 2>&1 || true
+        echo "FAIL: server logs and test data preserved at $WORK_DIR" >&2
+        tail -n 50 "$WORK_DIR/server.log" >&2
     fi
-    # Keep the bind-mounted data volume for post-run inspection; only the
-    # generated TLS certificate/fingerprint changes when Compose is rebuilt.
-    docker compose -f "$COMPOSE_FILE" down || true
-    rm -rf "$WORK_DIR"
+    "${compose[@]}" down --rmi local || true
+    if [[ "$status" -eq 0 ]]; then
+        rm -rf "$WORK_DIR"
+    fi
     exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-mkdir -p "$DATA_DIR"
-docker compose -f "$COMPOSE_FILE" up -d --build
+mkdir -p "$KITE_DATA_DIR"
+"${compose[@]}" up -d --build
+endpoint="$("${compose[@]}" port kite-server 8443)"
+port="${endpoint##*:}"
+BASE_URL="https://localhost:$port"
 
 healthy=0
 health_deadline=$((SECONDS + 60))
 while (( SECONDS < health_deadline )); do
     remaining=$((health_deadline - SECONDS))
     curl_timeout=$((remaining < 2 ? remaining : 2))
-    if curl -ksS --max-time "$curl_timeout" -o "$WORK_DIR/health.json" -w '%{http_code}' \
+    if curl --noproxy '*' -ksS --max-time "$curl_timeout" -o "$WORK_DIR/health.json" -w '%{http_code}' \
         "$BASE_URL/healthz" | grep -qx '200'; then
         healthy=1
         break
@@ -53,26 +52,29 @@ while (( SECONDS < health_deadline )); do
 done
 if [[ "$healthy" -ne 1 ]]; then
     echo "FAIL: server did not become healthy within 60 seconds" >&2
-    docker compose -f "$COMPOSE_FILE" logs --tail=50 kite-server >&2
+    "${compose[@]}" logs --tail=50 kite-server >&2
     exit 1
 fi
 echo "HEALTH_OK $(cat "$WORK_DIR/health.json")"
 
-fingerprint="$(tr -d '[:space:]' < "$DATA_DIR/fingerprint.txt")"
+fingerprint="$(tr -d '[:space:]' < "$KITE_DATA_DIR/fingerprint.txt")"
 if [[ ! "$fingerprint" =~ ^[[:xdigit:]]{64}$ ]]; then
-    echo "FAIL: invalid server fingerprint in $DATA_DIR/fingerprint.txt" >&2
+    echo "FAIL: invalid server fingerprint in $KITE_DATA_DIR/fingerprint.txt" >&2
     exit 1
 fi
 
-cargo build --locked --example smoke_node -p kite-core
+cargo build --manifest-path "$ROOT/Cargo.toml" --locked --example smoke_node -p kite-core
 NODE="$ROOT/target/debug/examples/smoke_node"
+payload="$WORK_DIR/payload.bin"
+dd if=/dev/urandom of="$payload" bs=1M count=1 status=none
+expected_hash="$(sha256sum "$payload" | cut -d' ' -f1)"
 
 "$NODE" --server-url "$BASE_URL" --ca-fingerprint "$fingerprint" --role A \
-    --invite-file "$WORK_DIR/alice-invite.txt" --store "$WORK_DIR/alice.db" \
+    --invite-file "$WORK_DIR/alice-invite.txt" --file "$payload" --store "$WORK_DIR/alice.db" \
     >"$WORK_DIR/alice.log" 2>&1 &
 alice_pid=$!
 "$NODE" --server-url "$BASE_URL" --ca-fingerprint "$fingerprint" --role B \
-    --invite-file "$WORK_DIR/alice-invite.txt" --store "$WORK_DIR/bob.db" \
+    --invite-file "$WORK_DIR/alice-invite.txt" --file "$payload" --store "$WORK_DIR/bob.db" \
     >"$WORK_DIR/bob.log" 2>&1 &
 bob_pid=$!
 
@@ -86,35 +88,37 @@ fi
 cat "$WORK_DIR/alice.log" "$WORK_DIR/bob.log"
 for expected in \
     'REGISTER_OK role=A' 'INVITE_OK' 'PAIR_REQUEST_SENT' 'PAIR_OK' 'TEXT_SENT_OK' \
-    'REGISTER_OK role=B' 'TEXT_RECEIVED_OK' 'SMOKE-OK role=A' 'SMOKE-OK role=B'; do
+    'REGISTER_OK role=B' 'TEXT_RECEIVED_OK' 'FILE_ROUNDTRIP_OK' \
+    "sha256=$expected_hash" 'SMOKE-OK role=A' 'SMOKE-OK role=B'; do
     if ! grep -qF "$expected" "$WORK_DIR/alice.log" "$WORK_DIR/bob.log"; then
         echo "FAIL: missing smoke assertion: $expected" >&2
         linux_ok=0
     fi
 done
 if [[ "$linux_ok" -ne 1 ]]; then
-    echo "FAIL: Linux register/discovery/pair/send/receive leg failed" >&2
+    echo "FAIL: Linux encrypted message or file transfer failed" >&2
     exit 1
 fi
-echo "LINUX_CLIENTS_OK register/discovery/pair/send/decrypt"
+echo "LINUX_CLIENTS_OK register/discovery/pair/send/decrypt/file_sha256"
 
-if ! ssh -o BatchMode=yes -o ConnectTimeout=5 vmwin 'exit 0' >/dev/null 2>&1; then
+if ! ssh -o BatchMode=yes -o ConnectTimeout=5 vmwin whoami >/dev/null 2>&1; then
     echo "SKIP: Windows leg: vmwin is unreachable; Linux legs passed"
     exit 0
 fi
 
 windows_ok=0
 for host_ip in $(hostname -I); do
+    case "$host_ip" in *:*) continue ;; esac
     # Prefer PowerShell for the connectivity assertion. Some VM TLS stacks
     # cannot negotiate with rustls, so fall back to Windows' built-in curl.
-    ps_command="[Net.ServicePointManager]::ServerCertificateValidationCallback={\$true}; \$r=Invoke-WebRequest -UseBasicParsing -Uri 'https://${host_ip}:8443/healthz' -TimeoutSec 10; if (\$r.StatusCode -ne 200) { exit 1 }; exit 0"
+    ps_command="[Net.ServicePointManager]::ServerCertificateValidationCallback={\$true}; \$r=Invoke-WebRequest -UseBasicParsing -Uri 'https://${host_ip}:$port/healthz' -TimeoutSec 10; if (\$r.StatusCode -ne 200) { exit 1 }; exit 0"
     encoded="$(printf '%s' "$ps_command" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
     if ssh -o BatchMode=yes -o ConnectTimeout=5 vmwin \
         "powershell -NoProfile -EncodedCommand $encoded" >/dev/null 2>&1 ||
         ssh -o BatchMode=yes -o ConnectTimeout=5 vmwin \
-            "curl.exe -k -s -o NUL -w \"%{http_code}\" https://${host_ip}:8443/healthz" |
+            "curl.exe --noproxy * --max-time 10 -k -s -o NUL -w \"%{http_code}\" https://${host_ip}:$port/healthz" |
         grep -qx '200'; then
-        echo "WINDOWS_CONNECTIVITY_OK https://${host_ip}:8443/healthz returned HTTP 200"
+        echo "WINDOWS_CONNECTIVITY_OK https://${host_ip}:$port/healthz returned HTTP 200"
         windows_ok=1
         break
     fi

@@ -6,6 +6,7 @@ use chatlog::{ChatLog, ChatRecord, Conversation};
 use kite_core::{Engine, GroupDto, InboxEvent};
 use serde::Serialize;
 use settings::{Account, Settings, account_id};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(desktop)]
@@ -26,12 +27,14 @@ struct AppState {
     settings: Mutex<Settings>,
     engine: Mutex<Option<Loaded>>,
     /// Shared from Android intents or `--share` command line invocations.
-    share: StdMutex<Option<SharePayload>>,
+    share: StdMutex<VecDeque<SharePayload>>,
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SharePayload {
+    #[serde(default)]
+    batch: Option<String>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
@@ -162,6 +165,7 @@ fn parse_share_args(args: &[String]) -> Option<SharePayload> {
         None
     } else {
         Some(SharePayload {
+            batch: None,
             text: None,
             files,
         })
@@ -175,16 +179,52 @@ fn android_share_dir(root: &Path) -> PathBuf {
 }
 
 fn take_android_share(root: &Path) -> Option<SharePayload> {
-    let path = android_share_dir(root).join("share.json");
-    let bytes = std::fs::read(&path).ok()?;
-    let payload: SharePayload = serde_json::from_slice(&bytes).ok()?;
-    let _ = std::fs::remove_file(&path);
+    let directory = android_share_dir(root);
+    let mut batches: Vec<_> = std::fs::read_dir(&directory).ok()?.flatten().collect();
+    batches.sort_unstable_by_key(|entry| entry.file_name());
+    for batch in batches {
+        let Ok(name) = batch.file_name().into_string() else {
+            continue;
+        };
+        if !valid_share_batch(&name) {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(batch.path().join("share.json")) {
+            if let Ok(mut payload) = serde_json::from_slice::<SharePayload>(&bytes) {
+                payload.batch = Some(name);
+                return Some(payload);
+            }
+        }
+    }
+    // Older versions stored a single share directly in incoming_share.
+    let legacy = directory.join("share.json");
+    let payload = serde_json::from_slice(&std::fs::read(&legacy).ok()?).ok()?;
+    std::fs::remove_file(legacy).ok()?;
     Some(payload)
 }
 
+fn valid_share_batch(batch: &str) -> bool {
+    !batch.is_empty()
+        && batch
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+#[tauri::command]
+fn finish_share(state: tauri::State<'_, Arc<AppState>>, batch: &str) -> Result<(), String> {
+    if !valid_share_batch(batch) {
+        return Err("Invalid share batch".into());
+    }
+    match std::fs::remove_dir_all(android_share_dir(&state.root).join(batch)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn store_share(state: &AppState, payload: SharePayload) {
-    if let Ok(mut slot) = state.share.lock() {
-        *slot = Some(payload);
+    if let Ok(mut queue) = state.share.lock() {
+        queue.push_back(payload);
     }
 }
 
@@ -486,7 +526,7 @@ async fn remove_contact(state: tauri::State<'_, Arc<AppState>>, peer: String) ->
 
 #[tauri::command]
 async fn take_share(state: tauri::State<'_, Arc<AppState>>) -> Result<Option<SharePayload>, String> {
-    let pending = state.share.lock().ok().and_then(|mut slot| slot.take());
+    let pending = state.share.lock().ok().and_then(|mut queue| queue.pop_front());
     Ok(pending.or_else(|| take_android_share(&state.root)))
 }
 
@@ -658,11 +698,15 @@ async fn send_file(
     state: tauri::State<'_, Arc<AppState>>,
     peer: String,
     path: String,
+    name: Option<String>,
 ) -> Result<String, String> {
     let path_buf = PathBuf::from(&path);
-    let name = path_buf
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+    let name = name
+        .or_else(|| {
+            path_buf
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
         .ok_or("无法读取文件名")?;
     let bytes = std::fs::read(&path_buf).map_err(|e| format!("读取文件失败: {e}"))?;
     if bytes.is_empty() {
@@ -1058,7 +1102,7 @@ pub fn run() {
             app.manage(Arc::new(AppState {
                 settings: Mutex::new(settings),
                 engine: Mutex::new(None),
-                share: StdMutex::new(pending),
+                share: StdMutex::new(pending.into_iter().collect()),
                 root,
             }));
 
@@ -1107,6 +1151,7 @@ pub fn run() {
             conversations,
             remove_contact,
             take_share,
+            finish_share,
             peer_security,
             unpair,
             list_groups,

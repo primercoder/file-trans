@@ -1,16 +1,17 @@
-# Release 构建手册（0.1.0）
+# Release 构建手册
 
-所有产物最终归集到仓库根目录 `dist/`（已 gitignore，不入库）。
+从待发布的 Git 标签检出源码。下文以 `v0.1.0` 为例，各平台的发布附件可归集到仓库根目录 `dist/`。
 
-## 0. 前置条件
+## 前置条件
 
-- Rust 1.100 + `rustup target add aarch64-unknown-linux-gnu aarch64-pc-windows-msvc`
+- Rust stable，由仓库的工具链配置选择。交叉编译时运行 `rustup target add aarch64-unknown-linux-gnu aarch64-pc-windows-msvc`
+- 客户端需要 Node.js 和对应平台的 [Tauri 构建依赖](https://v2.tauri.app/start/prerequisites/)。
 - Linux 交叉工具：`gcc-aarch64-linux-gnu`、`clang`、`lld`、`cargo-xwin`
 - Android：Android SDK/NDK + 自签 keystore + `apps/desktop/src-tauri/gen/android/keystore.properties`
 - Windows 打包：`nsis`（Linux 版 makensis 即可）
 - Linux 打包：Tauri 自带 AppImage 打包（需要网络；也可用 appimagetool 手工打包）
 
-## 0. 图标
+## 图标
 
 所有平台共用仓库根目录的 `icon.png`：
 
@@ -25,20 +26,20 @@ Android 自适应图标的背景色在 `gen/android/.../values/ic_launcher_backg
 
 ```bash
 # Linux x64
-cargo build --release -p kite-server
+cargo build --locked --release -p kite-server
 strip target/release/kite-server
 
 # Linux arm64
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-cargo build --release -p kite-server --target aarch64-unknown-linux-gnu
+cargo build --locked --release -p kite-server --target aarch64-unknown-linux-gnu
 aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/kite-server
 
 # Windows x64（在 Windows 构建机 / VM 内）
-cargo build --release -p kite-server
+cargo build --locked --release -p kite-server
 
 # Windows arm64（x64 Linux 上交叉编译）
-cargo xwin build --release -p kite-server --target aarch64-pc-windows-msvc
+cargo xwin build --locked --release -p kite-server --target aarch64-pc-windows-msvc
 ```
 
 打包：每个平台一个压缩包，内含 `kite-server`(`.exe`) 与 `README.txt`。
@@ -58,20 +59,21 @@ objdump -T target/glibc-22.04/kite-server-linux-x64 | grep -oE 'GLIBC_[0-9.]+' |
 
 ```bash
 cd apps/desktop
-npx tauri build          # 产出 kite-desktop、deb、rpm、AppImage
+npm ci
+npm run tauri build -- --bundles deb -- --locked
 ```
 
-归集：
+构建产物在 `apps/desktop/src-tauri/target/release/`。可使用 `--bundles deb,rpm,appimage` 生成多种格式。归集时可用以下文件名。
 
 - `dist/linux/kite-desktop-linux-x64`（裸二进制）
 - `dist/linux/kite-0.1.0-amd64.deb`
 - `dist/linux/kite-0.1.0-x86_64.AppImage`
 - `dist/linux/kite-0.1.0-linux-x64-portable.tar.gz`（`kite-desktop` + `README.txt`）
 
-Linux 安装包还需要文件管理器集成（KDE 服务菜单、Nautilus 脚本）：
+在仓库根目录运行以下命令，将 KDE 服务菜单和 Nautilus 脚本加入 `.deb`。
 
 ```bash
-./scripts/add_desktop_integration.sh target/release/bundle/deb/Kite_0.1.0_amd64.deb
+./scripts/add_desktop_integration.sh apps/desktop/src-tauri/target/release/bundle/deb/Kite_0.1.0_amd64.deb
 ```
 
 若 Tauri 打包 AppImage 时无法下载 AppRun，可手工打包：
@@ -86,8 +88,9 @@ ARCH=x86_64 appimagetool --no-appstream Kite.AppDir kite-0.1.0-x86_64.AppImage
 在 Windows 构建机内：
 
 ```bat
-cd apps\desktop\src-tauri
-cargo build --release
+cd apps\desktop
+npm ci
+npm run tauri build -- --no-bundle -- --locked
 ```
 
 取回 `kite-desktop.exe` 后：
@@ -107,19 +110,15 @@ makensis -DSOURCE_EXE=/path/to/kite-desktop.exe scripts/windows-installer.nsi
 
 ```bash
 cd apps/desktop
-npx tauri android build --target x86_64     # → dist/android/kite-0.1.0-x64-release.apk
-npx tauri android build --target aarch64    # → dist/android/kite-0.1.0-arm64-release.apk
+npm ci
+npm run tauri android build -- --apk --split-per-abi --target aarch64 x86_64 -- --locked
 ```
 
-签名使用 `apps/desktop/src-tauri/gen/android/keystore.properties`（不入库）指向的自签 keystore；
-校验：`apksigner verify --print-certs <apk>`。
+APK 位于 `apps/desktop/src-tauri/gen/android/app/build/outputs/apk/`。构建使用本机 `apps/desktop/src-tauri/gen/android/keystore.properties` 指定的签名密钥。将通过 `apksigner verify --print-certs <apk>` 校验的 APK 复制到发布目录。更新 APK 时应沿用原有签名密钥。
 
 ## 5. 校验清单
 
-```bash
-cd dist
-sha256sum android/*.apk linux/* windows/* server/* docs/* > checksums.txt
-```
+把本次发布的二进制压缩包、安装包和 APK 复制到独立的发布目录，为实际发布的文件执行 `sha256sum`，生成 `SHA256SUMS` 并和附件一起上传。下载后可在同一目录运行 `sha256sum -c SHA256SUMS`。签名密钥和签名配置留在构建环境。
 
 ## 6. 常见问题
 

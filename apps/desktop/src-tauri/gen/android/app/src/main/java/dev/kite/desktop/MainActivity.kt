@@ -9,12 +9,13 @@ import androidx.activity.enableEdgeToEdge
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.UUID
 
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
-    handleSharedContent(intent)
+    if (savedInstanceState == null) handleSharedContent(intent)
   }
 
   override fun onNewIntent(intent: Intent) {
@@ -31,27 +32,24 @@ class MainActivity : TauriActivity() {
     if (intent == null) return
     if (intent.action != Intent.ACTION_SEND && intent.action != Intent.ACTION_SEND_MULTIPLE) return
 
-    val directory = File(applicationContext.dataDir, "incoming_share")
-    directory.mkdirs()
-    directory.listFiles()?.forEach { if (it.name != "share.json") it.delete() }
+    val batch = "${System.currentTimeMillis()}-${UUID.randomUUID()}"
+    val directory = File(applicationContext.dataDir, "incoming_share/$batch")
+    if (!directory.mkdirs()) return
 
     val files = JSONArray()
     fun copy(uri: Uri?) {
       uri ?: return
-      val name = displayName(uri) ?: "shared-file"
-      var target = File(directory, name)
-      var counter = 1
-      while (target.exists()) {
-        target = File(directory, "$counter-$name")
-        counter += 1
-      }
+      val name = displayName(uri)?.substringAfterLast('/')?.substringAfterLast('\\')
+        ?.takeIf { it.isNotBlank() && it != "." && it != ".." } ?: "shared-file"
+      val target = File(directory, "file-${files.length()}")
       try {
         contentResolver.openInputStream(uri).use { input ->
           if (input == null) return
           target.outputStream().use { output -> input.copyTo(output) }
         }
-        files.put(JSONObject().put("path", target.absolutePath).put("name", target.name))
+        files.put(JSONObject().put("path", target.absolutePath).put("name", name))
       } catch (_: Exception) {
+        target.delete()
         // Ignore unreadable shares; the user can retry from the source app.
       }
     }
@@ -68,11 +66,21 @@ class MainActivity : TauriActivity() {
       ?: intent.getStringExtra(Intent.EXTRA_TEXT)
       ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
     Log.i("KiteShare", "action=${intent.action} files=${files.length()} text=${text?.length ?: -1}")
-    if (files.length() == 0 && text.isNullOrBlank()) return
+    if (files.length() == 0 && text.isNullOrBlank()) {
+      directory.deleteRecursively()
+      return
+    }
 
     val payload = JSONObject().put("files", files)
     if (!text.isNullOrBlank()) payload.put("text", text)
-    File(directory, "share.json").writeText(payload.toString())
+    try {
+      val temp = File(directory, "share.tmp")
+      temp.writeText(payload.toString())
+      if (!temp.renameTo(File(directory, "share.json"))) directory.deleteRecursively()
+    } catch (error: Exception) {
+      Log.w("KiteShare", "Could not queue share", error)
+      directory.deleteRecursively()
+    }
   }
 
   private fun displayName(uri: Uri): String? {

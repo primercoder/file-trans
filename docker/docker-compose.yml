@@ -3,10 +3,11 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.server
+    user: "${KITE_CONTAINER_USER:-0:0}"
     ports:
-      - "8443:8443"
+      - "${KITE_PUBLISH_PORT:-8443}:8443"
     volumes:
-      - ./data:/data
+      - "${KITE_DATA_DIR:-./data}:/data"
     environment:
       KITE_BIND: 0.0.0.0:8443
       KITE_DB_PATH: /data/kite.db

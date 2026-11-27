@@ -1,7 +1,8 @@
 # Pin the compiler version; the trixie runtime below matches this builder's glibc.
 FROM rust:1.99-slim AS builder
 WORKDIR /build
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
 RUN cargo build --locked --release -p kite-server
 
 # Match the builder's Debian release so the binary's glibc requirement is met.

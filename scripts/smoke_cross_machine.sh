@@ -4,11 +4,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOST="${KITE_VM_HOST:-vmwin}"
+SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 REMOTE_DIR='C:\Users\win\Desktop\kite'
 REMOTE_HOME='C:\Users\win'
 FILE_PATH="${1:-}"
 RUN_ID="$(date +%s%N)-$$"
-WORK_DIR="$(mktemp -d /tmp/opencode/kite-cross-smoke.XXXXXX)"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/kite-cross-smoke.XXXXXX)"
 SERVER_PID=''
 A_PID=''
 B_PID=''
@@ -22,8 +23,8 @@ cleanup() {
             wait "$pid" 2>/dev/null || true
         fi
     done
-    ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" \
-        "cmd /c \"del /q $REMOTE_DIR\\cross-smoke-invite-$RUN_ID.txt $REMOTE_DIR\\cross-smoke-B-$RUN_ID.db $REMOTE_DIR\\cross-smoke-payload.bin 2>NUL\"" \
+    ssh "${SSH_OPTIONS[@]}" "$HOST" \
+        "cmd /c \"del /q $REMOTE_DIR\\cross-smoke-invite-$RUN_ID.txt $REMOTE_DIR\\cross-smoke-B-$RUN_ID.db $REMOTE_DIR\\cross-smoke-payload-$RUN_ID.bin 2>NUL\"" \
         >/dev/null 2>&1 || true
     if [[ "$status" -ne 0 ]]; then
         echo "CROSS_SMOKE_FAIL logs preserved in $WORK_DIR" >&2
@@ -38,7 +39,9 @@ cleanup() {
     fi
     exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ -n "$FILE_PATH" ]]; then
     if [[ ! -f "$FILE_PATH" ]]; then
@@ -50,7 +53,7 @@ else
     dd if=/dev/urandom of="$FILE_PATH" bs=1M count=1 status=none
 fi
 
-cargo build --locked --workspace --examples
+cargo build --manifest-path "$ROOT/Cargo.toml" --locked --workspace --bins --examples
 NODE="$ROOT/target/debug/examples/smoke_node"
 SERVER="$ROOT/target/debug/kite-server"
 pick_port() {
@@ -84,23 +87,18 @@ curl --noproxy '*' -fsS "http://127.0.0.1:$HEALTH_PORT/healthz" >"$WORK_DIR/heal
 echo "SERVER_OK bind=0.0.0.0:$API_PORT fingerprint=$fingerprint"
 
 # Ship exactly the tested source (not target/, VCS metadata, or local databases).
-tar --exclude='./target' --exclude='./.git' --exclude='./.superpowers' --exclude='./dist' \
-    --exclude='./apps/desktop/node_modules' --exclude='./apps/desktop/src-tauri/target' \
-    --exclude='./apps/desktop/src-tauri/gen/android/app/build' \
-    --exclude='./apps/desktop/src-tauri/gen/android/build' \
-    --exclude='./apps/desktop/src-tauri/gen/android/.gradle' \
-    --exclude='*.db' --exclude='*.db-*' --exclude='*.log' \
-    -C "$ROOT" -cf "$WORK_DIR/source.tar" .
-ssh -o BatchMode=yes "$HOST" "cmd /c \"if not exist $REMOTE_DIR mkdir $REMOTE_DIR\""
-scp -q -o BatchMode=yes "$WORK_DIR/source.tar" "$HOST:C:/Users/win/Desktop/kite-smoke-source.tar"
-ssh -o BatchMode=yes "$HOST" \
-    "cmd /c \"cd /d $REMOTE_DIR && tar -xf C:\\Users\\win\\Desktop\\kite-smoke-source.tar && del /q C:\\Users\\win\\Desktop\\kite-smoke-source.tar\""
+git -C "$ROOT" ls-files -z --cached |
+    tar -C "$ROOT" --null --verbatim-files-from -cf "$WORK_DIR/source.tar" -T -
+ssh "${SSH_OPTIONS[@]}" "$HOST" "cmd /c \"if not exist $REMOTE_DIR mkdir $REMOTE_DIR\""
+scp -q "${SSH_OPTIONS[@]}" "$WORK_DIR/source.tar" "$HOST:C:/Users/win/Desktop/kite-smoke-source-$RUN_ID.tar"
+ssh "${SSH_OPTIONS[@]}" "$HOST" \
+    "cmd /c \"cd /d $REMOTE_DIR && tar -xf C:\\Users\\win\\Desktop\\kite-smoke-source-$RUN_ID.tar && del /q C:\\Users\\win\\Desktop\\kite-smoke-source-$RUN_ID.tar\""
 
 HOST_IP=''
 for candidate in $(hostname -I); do
     case "$candidate" in *:*) continue ;; esac
-    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" \
-        "curl.exe --noproxy * -k -s -o NUL -w \"%{http_code}\" https://$candidate:$API_PORT/healthz" \
+    if ssh "${SSH_OPTIONS[@]}" "$HOST" \
+        "curl.exe --noproxy * --max-time 8 -k -s -o NUL -w \"%{http_code}\" https://$candidate:$API_PORT/healthz" \
         2>/dev/null | grep -qx '200'; then
         HOST_IP="$candidate"
         break
@@ -115,20 +113,20 @@ echo "WINDOWS_CONNECTIVITY_OK $BASE_URL"
 
 # Finish first-run compilation before the protocol timeout starts. This also
 # avoids masking a slow linker/antivirus scan as a messaging failure.
-ssh -o BatchMode=yes -o ServerAliveInterval=30 "$HOST" \
+ssh "${SSH_OPTIONS[@]}" "$HOST" \
     "cmd /c \"cd /d $REMOTE_DIR && set \"PATH=$REMOTE_HOME\\.cargo\\bin;%PATH%\" && set \"CARGO_TERM_COLOR=never\" && cargo build --locked --example smoke_node -p kite-core\""
 
 REMOTE_INVITE="$REMOTE_DIR\\cross-smoke-invite-$RUN_ID.txt"
 REMOTE_STORE="$REMOTE_DIR\\cross-smoke-B-$RUN_ID.db"
 # Run through cargo on Windows as well: this verifies the example builds there.
 # Clearing proxy variables is important for a host-local LAN connection.
-ssh -o BatchMode=yes -o ServerAliveInterval=30 "$HOST" \
-    "cmd /c \"cd /d $REMOTE_DIR && set \"PATH=$REMOTE_HOME\\.cargo\\bin;%PATH%\" && set \"CARGO_TERM_COLOR=never\" && set \"HTTP_PROXY=\" && set \"HTTPS_PROXY=\" && set \"http_proxy=\" && set \"https_proxy=\" && set \"ALL_PROXY=\" && set \"all_proxy=\" && set \"NO_PROXY=$HOST_IP\" && set \"no_proxy=$HOST_IP\" && cargo run --locked --quiet --example smoke_node -p kite-core -- --server-url $BASE_URL --ca-fingerprint $fingerprint --role B --invite-file $REMOTE_INVITE --file $REMOTE_DIR\\cross-smoke-payload.bin --store $REMOTE_STORE\"" \
+ssh "${SSH_OPTIONS[@]}" "$HOST" \
+    "cmd /c \"cd /d $REMOTE_DIR && set \"PATH=$REMOTE_HOME\\.cargo\\bin;%PATH%\" && set \"CARGO_TERM_COLOR=never\" && set \"HTTP_PROXY=\" && set \"HTTPS_PROXY=\" && set \"http_proxy=\" && set \"https_proxy=\" && set \"ALL_PROXY=\" && set \"all_proxy=\" && set \"NO_PROXY=$HOST_IP\" && set \"no_proxy=$HOST_IP\" && cargo run --locked --quiet --example smoke_node -p kite-core -- --server-url $BASE_URL --ca-fingerprint $fingerprint --role B --invite-file $REMOTE_INVITE --file $REMOTE_DIR\\cross-smoke-payload-$RUN_ID.bin --store $REMOTE_STORE\"" \
     >"$WORK_DIR/windows-b.log" 2>&1 &
 B_PID=$!
 
 # B compares its decrypted download against this local copy of the original.
-scp -q -o BatchMode=yes "$FILE_PATH" "$HOST:C:/Users/win/Desktop/kite/cross-smoke-payload.bin"
+scp -q "${SSH_OPTIONS[@]}" "$FILE_PATH" "$HOST:C:/Users/win/Desktop/kite/cross-smoke-payload-$RUN_ID.bin"
 
 "$NODE" --server-url "$BASE_URL" --ca-fingerprint "$fingerprint" --role A \
     --invite-file "$WORK_DIR/invite.txt" --file "$FILE_PATH" \
@@ -139,7 +137,7 @@ A_PID=$!
 # device-directory discovery and X3DH; the invite is not a trusted credential.
 for _ in $(seq 1 100); do
     if [[ -s "$WORK_DIR/invite.txt" ]]; then
-        scp -q -o BatchMode=yes "$WORK_DIR/invite.txt" "$HOST:C:/Users/win/Desktop/kite/cross-smoke-invite-$RUN_ID.txt"
+        scp -q "${SSH_OPTIONS[@]}" "$WORK_DIR/invite.txt" "$HOST:C:/Users/win/Desktop/kite/cross-smoke-invite-$RUN_ID.txt"
         break
     fi
     sleep 0.05
@@ -171,6 +169,6 @@ for assertion in 'SMOKE-OK role=B' 'TEXT_RECEIVED_OK' 'FILE_ROUNDTRIP_OK'; do
 done
 EXPECTED_SHA="$(sha256sum "$FILE_PATH" | cut -d' ' -f1)"
 grep -qF "sha256=$EXPECTED_SHA" "$WORK_DIR/windows-b.log"
-ssh -o BatchMode=yes "$HOST" \
-    "cmd /c \"del /q $REMOTE_INVITE $REMOTE_STORE $REMOTE_DIR\\cross-smoke-payload.bin 2>NUL\"" || true
+ssh "${SSH_OPTIONS[@]}" "$HOST" \
+    "cmd /c \"del /q $REMOTE_INVITE $REMOTE_STORE $REMOTE_DIR\\cross-smoke-payload-$RUN_ID.bin 2>NUL\"" || true
 echo "CROSS_SMOKE_PASS linux_A=SMOKE-OK windows_B=SMOKE-OK file_bytes=$(stat -c %s "$FILE_PATH") sha256=$EXPECTED_SHA"

@@ -21,23 +21,21 @@ From an interactive PowerShell session in the source directory:
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-cargo build --locked --workspace --examples
-$env:CARGO_BIN_EXE_kite_server = "$PWD\target\debug\kite-server.exe"
+cargo build --locked --workspace --bins --examples
+[Environment]::SetEnvironmentVariable("CARGO_BIN_EXE_kite-server", "$PWD\target\debug\kite-server.exe")
 cargo test --locked --workspace
 cargo clippy --locked --workspace -- -D warnings
 ```
 
-The server integration tests look up Cargo's `CARGO_BIN_EXE_kite-server`
-variable (hyphen, matching the binary package name). Current Cargo supplies it
-automatically; the explicit assignment above is useful for custom test runners.
-The deploy script also sets it after building so this does not depend on that
-Cargo behavior.
+The `kite-core` integration tests use `CARGO_BIN_EXE_kite-server` to locate the
+binary from the `kite-server` crate. Both command examples and the deploy script
+set the variable before calling Cargo.
 
 The equivalent `cmd.exe` commands are:
 
 ```bat
 set PATH=%USERPROFILE%\.cargo\bin;%PATH%
-cargo build --locked --workspace --examples
+cargo build --locked --workspace --bins --examples
 set CARGO_BIN_EXE_kite-server=C:\Users\win\Desktop\kite\target\debug\kite-server.exe
 cargo test --locked --workspace
 ```
@@ -108,14 +106,10 @@ X3DH pairing: A still sends a pair request and B must accept it.
   connection timeout proves this is necessary, and record that rule explicitly.
 - **Path separators:** remote `cmd` commands need backslashes; archive/SCP target
   syntax uses `C:/Users/win/Desktop/...`. Quote complete remote command strings.
-- **Proxy:** direct crates.io access was used successfully for the initial VM
-  build; no VM registry cache existed beforehand. The Linux host's Clash proxy
-  at `127.0.0.1:7897` listens only on loopback: neither `192.168.122.1:7897` nor
-  `10.12.154.115:7897` is reachable from the VM. Do not copy the Linux loopback
-  proxy setting into Windows. The cross-machine smoke clears proxy variables
-  and sets `NO_PROXY` for the host LAN address. If direct registry access later
-  fails, expose a host proxy deliberately on the VM-reachable interface (with
-  appropriate access controls) or configure a VM-local proxy, then set
-  `HTTP_PROXY`/`HTTPS_PROXY` before Cargo.
+- **Proxy**
+  The cross-machine smoke clears proxy variables and sets `NO_PROXY` for the
+  Linux host address. If Windows needs a proxy to reach the package registry,
+  use a VM-local proxy or an address reachable from the VM, then set
+  `HTTP_PROXY` and `HTTPS_PROXY` for the dependency build.
 - **PowerShell shims:** `where` is unreliable over non-interactive SSH and
   `npm.ps1` can be blocked. Use full executable paths and `.cmd` shims.

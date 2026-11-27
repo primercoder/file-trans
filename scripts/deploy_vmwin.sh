@@ -5,10 +5,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOST="${KITE_VM_HOST:-vmwin}"
+SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 REMOTE_DIR='C:\Users\win\Desktop\kite'
 REMOTE_HOME='C:\Users\win'
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
-WORK_DIR="$(mktemp -d /tmp/opencode/kite-vmwin-deploy.XXXXXX)"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/kite-vmwin-deploy.XXXXXX)"
 ARCHIVE="$WORK_DIR/kite-source.tar"
 LOG="${KITE_DEPLOY_LOG:-$ROOT/target/vmwin-test-$RUN_ID.log}"
 STATUS=FAIL
@@ -20,23 +21,21 @@ trap cleanup EXIT
 
 mkdir -p "$(dirname "$LOG")"
 echo "DEPLOY_START host=$HOST source=$ROOT log=$LOG"
-tar --exclude='./target' --exclude='./.git' --exclude='./.superpowers' --exclude='./dist' \
-    --exclude='./apps/desktop/node_modules' --exclude='./apps/desktop/src-tauri/target' \
-    --exclude='*.db' --exclude='*.db-*' --exclude='*.log' \
-    -C "$ROOT" -cf "$ARCHIVE" .
+git -C "$ROOT" ls-files -z --cached |
+    tar -C "$ROOT" --null --verbatim-files-from -cf "$ARCHIVE" -T -
 
-ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
+ssh "${SSH_OPTIONS[@]}" "$HOST" \
     "cmd /c \"if not exist $REMOTE_DIR mkdir $REMOTE_DIR\""
-scp -q -o BatchMode=yes "$ARCHIVE" "$HOST:C:/Users/win/Desktop/kite-source.tar"
-ssh -o BatchMode=yes "$HOST" \
-    "cmd /c \"cd /d $REMOTE_DIR && tar -xf C:\\Users\\win\\Desktop\\kite-source.tar && del /q C:\\Users\\win\\Desktop\\kite-source.tar\""
+scp -q "${SSH_OPTIONS[@]}" "$ARCHIVE" "$HOST:C:/Users/win/Desktop/kite-source-$RUN_ID.tar"
+ssh "${SSH_OPTIONS[@]}" "$HOST" \
+    "cmd /c \"cd /d $REMOTE_DIR && tar -xf C:\\Users\\win\\Desktop\\kite-source-$RUN_ID.tar && del /q C:\\Users\\win\\Desktop\\kite-source-$RUN_ID.tar\""
 echo "DEPLOY_COPY_OK destination=$REMOTE_DIR"
 
 # Cargo sets CARGO_BIN_EXE_kite-server for integration tests. Setting it explicitly
 # as well makes the contract clear and supports older/custom Cargo harnesses.
 # Keep the existing remote target directory so repeated deployments are incremental.
 set +e
-ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=60 "$HOST" \
+ssh "${SSH_OPTIONS[@]}" "$HOST" \
     "cmd /c \"cd /d $REMOTE_DIR && set \"PATH=$REMOTE_HOME\\.cargo\\bin;%PATH%\" && set \"CARGO_TERM_COLOR=never\" && cargo build --locked --workspace --examples && set \"CARGO_BIN_EXE_kite-server=$REMOTE_DIR\\target\\debug\\kite-server.exe\" && cargo test --locked --workspace\"" \
     2>&1 | tee "$LOG"
 remote_status=${PIPESTATUS[0]}
