@@ -17,7 +17,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let health_app = kite_server::health_router(state);
     let tls = match config.tls_paths {
         Some((cert, key)) => kite_server::tls::from_pem_files(&cert, &key).await?,
-        None => kite_server::tls::self_signed().await?,
+        None => {
+            let directory = config
+                .db_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            kite_server::tls::self_signed_in(directory).await?
+        }
     };
     println!(
         "Kite TLS certificate SHA-256 fingerprint: {}",

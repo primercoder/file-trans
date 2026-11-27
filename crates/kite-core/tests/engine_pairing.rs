@@ -386,6 +386,11 @@ async fn unpair_notifies_the_peer_and_drops_the_session() {
         "peer must be told about the removal: {events:?}"
     );
     assert!(bob.paired_peers().unwrap().is_empty());
+    assert_eq!(
+        bob.contacts().unwrap(),
+        vec![(alice_id.clone(), "removed".to_owned())],
+        "a peer removal keeps a read-only contact entry"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -412,6 +417,37 @@ async fn deleting_an_account_removes_the_contact_on_peers() {
         "peers must learn about the deleted account: {events:?}"
     );
     assert!(bob.paired_peers().unwrap().is_empty());
+    assert_eq!(
+        bob.contacts().unwrap(),
+        vec![(alice_id.clone(), "deleted".to_owned())],
+        "a deleted account stays visible as an archived contact"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_contact_removal_clears_the_archived_entry() {
+    let server = TestServer::spawn();
+    let temp = tempfile::tempdir().unwrap();
+    let mut alice = engine(&temp, "alice", &server);
+    let mut bob = engine(&temp, "bob", &server);
+    alice.register("Alice", "a").await.unwrap();
+    bob.register("Bob", "b").await.unwrap();
+    let alice_id = alice.device_id().to_owned();
+    let bob_id = bob.device_id().to_owned();
+    alice.start_pairing(&bob_id).await.unwrap();
+    bob.poll_once().await.unwrap();
+    bob.confirm_pairing(&alice_id).await.unwrap();
+    alice.poll_once().await.unwrap();
+
+    // Bob receives a removal notice, then removes the entry manually.
+    alice.unpair(&bob_id).await.unwrap();
+    bob.poll_once().await.unwrap();
+    assert_eq!(bob.contacts().unwrap().len(), 1);
+    bob.delete_contact(&alice_id).await.unwrap();
+    assert!(
+        bob.contacts().unwrap().is_empty(),
+        "manual removal must purge the archived contact"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

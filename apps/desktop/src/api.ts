@@ -2,11 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountView,
   ChatView,
+  Conversation,
   DeviceInfo,
   GroupDto,
   Peer,
   PeerSecurity,
   PollResult,
+  SharePayload,
   Status,
 } from "./types";
 
@@ -21,6 +23,10 @@ export const api = {
     invoke<Status>("update_preferences", { theme, locale }),
   listDevices: () => invoke<DeviceInfo[]>("list_devices"),
   listPeers: () => invoke<Peer[]>("list_peers"),
+  listContacts: () => invoke<Peer[]>("list_contacts"),
+  conversations: () => invoke<Conversation[]>("conversations"),
+  removeContact: (peer: string) => invoke<void>("remove_contact", { peer }),
+  takeShare: () => invoke<SharePayload | null>("take_share"),
   peerSecurity: (peer: string) => invoke<PeerSecurity>("peer_security", { peer }),
   unpair: (peer: string) => invoke<void>("unpair", { peer }),
   listGroups: () => invoke<GroupDto[]>("list_groups"),

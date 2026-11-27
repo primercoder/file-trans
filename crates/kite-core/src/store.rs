@@ -67,6 +67,8 @@ pub struct EntryOutcome {
     pub remove_pending: Option<String>,
     pub consume_opk: Option<u32>,
     pub handshake_nonce: Option<(String, [u8; 32])>,
+    /// Keep a read-only contact entry after the peer removed this device.
+    pub archive_contact: Option<(String, String)>,
 }
 
 impl EntryOutcome {
@@ -93,6 +95,11 @@ impl Store {
              CREATE TABLE IF NOT EXISTS sessions(
                  device_id TEXT PRIMARY KEY, state BLOB NOT NULL,
                  status TEXT NOT NULL CHECK(status IN ('pending_accept','pending_outgoing','paired'))
+             );
+             CREATE TABLE IF NOT EXISTS archived_contacts(
+                 device_id TEXT PRIMARY KEY,
+                 status TEXT NOT NULL CHECK(status IN ('removed','deleted')),
+                 updated_at INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS pending_pairing(
                  device_id TEXT PRIMARY KEY, name TEXT NOT NULL, challenge BLOB NOT NULL
@@ -296,6 +303,47 @@ impl Store {
     }
 
     /// All known sessions with their pairing status, for UI peer lists.
+    /// Sessions plus archived contacts (peers that removed this device or
+    /// deleted their account). Archived entries stay visible read-only.
+    pub fn contacts(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT device_id,status FROM sessions
+             UNION ALL
+             SELECT device_id,status FROM archived_contacts
+             WHERE device_id NOT IN (SELECT device_id FROM sessions)",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn archive_contact(&self, peer: &str, status: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO archived_contacts(device_id,status,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(device_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at",
+            params![peer, status, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_archived(&self, peer: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM archived_contacts WHERE device_id=?1", [peer])?;
+        Ok(())
+    }
+
+    pub fn archived_status(&self, peer: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT status FROM archived_contacts WHERE device_id=?1",
+                [peer],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn sessions(&self) -> Result<Vec<(String, String)>> {
         let mut statement = self
             .connection
@@ -582,6 +630,18 @@ impl Store {
         if let Some(peer) = &outcome.remove_session {
             transaction.execute("DELETE FROM sessions WHERE device_id=?1", [peer])?;
         }
+        if let Some((peer, status)) = &outcome.archive_contact {
+            transaction.execute(
+                "INSERT INTO archived_contacts(device_id,status,updated_at) VALUES(?1,?2,?3)
+                 ON CONFLICT(device_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at",
+                params![peer, status, unix_now()],
+            )?;
+        }
+        if let Some((peer, _, status)) = &outcome.session
+            && status == "paired"
+        {
+            transaction.execute("DELETE FROM archived_contacts WHERE device_id=?1", [peer])?;
+        }
         if let Some((peer, name, challenge)) = &outcome.pending {
             transaction.execute(
                 "INSERT INTO pending_pairing(device_id,name,challenge) VALUES(?1,?2,?3)
@@ -697,6 +757,13 @@ fn save_session(connection: &Connection, peer: &str, state: &[u8], status: &str)
         params![peer, state, status],
     )?;
     Ok(())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn set_cursor(connection: &Connection, cursor: i64) -> Result<()> {

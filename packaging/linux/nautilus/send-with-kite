@@ -1,0 +1,3 @@
+#!/bin/sh
+# Nautilus script: copy to ~/.local/share/nautilus/scripts/ and make executable.
+exec kite-desktop --share "$@"

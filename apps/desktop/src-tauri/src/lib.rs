@@ -2,12 +2,12 @@ mod chatlog;
 mod settings;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use chatlog::{ChatLog, ChatRecord};
+use chatlog::{ChatLog, ChatRecord, Conversation};
 use kite_core::{Engine, GroupDto, InboxEvent};
 use serde::Serialize;
 use settings::{Account, Settings, account_id};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(desktop)]
 use tauri::menu::{Menu, MenuItem};
 #[cfg(desktop)]
@@ -25,6 +25,24 @@ struct AppState {
     root: PathBuf,
     settings: Mutex<Settings>,
     engine: Mutex<Option<Loaded>>,
+    /// Shared from Android intents or `--share` command line invocations.
+    share: StdMutex<Option<SharePayload>>,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SharePayload {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    files: Vec<ShareFile>,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareFile {
+    path: String,
+    name: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -122,6 +140,52 @@ fn raw_hw_id() -> String {
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "kite-device".into());
     format!("{host}-{}", std::env::consts::OS)
+}
+
+/// Parses `--share <path>...` from a command line (Windows context menu, Linux
+/// service menu, or a second-instance invocation).
+fn parse_share_args(args: &[String]) -> Option<SharePayload> {
+    let index = args.iter().position(|arg| arg == "--share")?;
+    let files: Vec<ShareFile> = args[index + 1..]
+        .iter()
+        .filter(|arg| !arg.starts_with("--"))
+        .filter_map(|path| {
+            let path_buf = PathBuf::from(path);
+            let name = path_buf.file_name()?.to_string_lossy().to_string();
+            Some(ShareFile {
+                path: path_buf.to_string_lossy().to_string(),
+                name,
+            })
+        })
+        .collect();
+    if files.is_empty() {
+        None
+    } else {
+        Some(SharePayload {
+            text: None,
+            files,
+        })
+    }
+}
+
+/// Android's MainActivity copies shared content into this directory because the
+/// WebView cannot read `content://` URIs directly.
+fn android_share_dir(root: &Path) -> PathBuf {
+    root.join("incoming_share")
+}
+
+fn take_android_share(root: &Path) -> Option<SharePayload> {
+    let path = android_share_dir(root).join("share.json");
+    let bytes = std::fs::read(&path).ok()?;
+    let payload: SharePayload = serde_json::from_slice(&bytes).ok()?;
+    let _ = std::fs::remove_file(&path);
+    Some(payload)
+}
+
+fn store_share(state: &AppState, payload: SharePayload) {
+    if let Ok(mut slot) = state.share.lock() {
+        *slot = Some(payload);
+    }
 }
 
 fn profile_dir(root: &Path, id: &str) -> PathBuf {
@@ -383,6 +447,47 @@ async fn update_preferences(
         settings.save(&state.root)?;
     }
     Ok(current_status(&state).await)
+}
+
+/// Contacts include archived peers (removed by them or deleted accounts) so the
+/// history stays reachable; the status tells the UI whether sending is allowed.
+#[tauri::command]
+async fn list_contacts(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<Peer>, String> {
+    let rows = with_engine(&state, |engine| {
+        Box::pin(async move { engine.contacts().map_err(kite_core::EngineError::from) })
+    })
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(device_id, status)| Peer {
+            device_id,
+            name: None,
+            status,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn conversations(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<Conversation>, String> {
+    chat_log(&state).await?.conversations()
+}
+
+/// Manual contact removal also drops the local history.
+#[tauri::command]
+async fn remove_contact(state: tauri::State<'_, Arc<AppState>>, peer: String) -> Result<(), String> {
+    with_engine(&state, |engine| {
+        let peer = peer.clone();
+        Box::pin(async move { engine.delete_contact(&peer).await })
+    })
+    .await?;
+    chat_log(&state).await?.remove_peer(&peer)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn take_share(state: tauri::State<'_, Arc<AppState>>) -> Result<Option<SharePayload>, String> {
+    let pending = state.share.lock().ok().and_then(|mut slot| slot.take());
+    Ok(pending.or_else(|| take_android_share(&state.root)))
 }
 
 #[tauri::command]
@@ -925,9 +1030,22 @@ async fn export_identity(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init());
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        if let Some(payload) = parse_share_args(&argv) {
+            let state = app.state::<Arc<AppState>>();
+            store_share(state.inner().as_ref(), payload);
+            let _ = app.emit("kite://share", ());
+        }
+    }));
+    builder
         .setup(|app| {
             let root = app
                 .path()
@@ -935,9 +1053,12 @@ pub fn run() {
                 .unwrap_or_else(|_| PathBuf::from("."));
             std::fs::create_dir_all(&root).ok();
             let settings = Settings::load(&root);
+            let startup_share = std::env::args().collect::<Vec<String>>();
+            let pending = parse_share_args(&startup_share);
             app.manage(Arc::new(AppState {
                 settings: Mutex::new(settings),
                 engine: Mutex::new(None),
+                share: StdMutex::new(pending),
                 root,
             }));
 
@@ -982,6 +1103,10 @@ pub fn run() {
             update_preferences,
             list_devices,
             list_peers,
+            list_contacts,
+            conversations,
+            remove_contact,
+            take_share,
             peer_security,
             unpair,
             list_groups,

@@ -3,9 +3,19 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { open } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { listen } from "@tauri-apps/api/event";
 import { api, groupSafety, shortId } from "./api";
 import { translate } from "./i18n";
-import type { AccountView, ChatView, DeviceInfo, GroupDto, Peer, Status } from "./types";
+import type {
+  AccountView,
+  ChatView,
+  Conversation,
+  DeviceInfo,
+  GroupDto,
+  Peer,
+  SharePayload,
+  Status,
+} from "./types";
 import Onboarding from "./components/Onboarding.vue";
 import MessageItem from "./components/MessageItem.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
@@ -40,6 +50,11 @@ const isMobile = ref(false);
 const dragOver = ref(false);
 const scroller = ref<HTMLElement | null>(null);
 const fileInput = ref<HTMLInputElement | null>(null);
+const conversations = ref<Record<string, Conversation>>({});
+const pendingShare = ref<SharePayload | null>(null);
+const shareBusy = ref(false);
+const lastRead = ref<Record<string, number>>({});
+const nameCache = ref<Record<string, string>>({});
 
 let timer: number | undefined;
 let polling = false;
@@ -62,42 +77,78 @@ const activePeer = computed(() => {
 });
 
 function peerName(id: string): string {
-  return deviceMap.value[id]?.name || shortId(id);
+  return deviceMap.value[id]?.name || nameCache.value[id] || shortId(id);
 }
 
 const contactRows = computed(() =>
   peers.value
     .filter((peer) => peer.status !== "pending_accept")
     .map((peer) => {
-    const device = deviceMap.value[peer.deviceId];
-    const paired = peer.status === "paired";
+      const device = deviceMap.value[peer.deviceId];
+      const conversation = conversations.value[peer.deviceId];
+      const paired = peer.status === "paired";
+      const archived = peer.status === "removed" || peer.status === "deleted";
+      const statusLabel = peer.status === "deleted"
+        ? t("list.deleted")
+        : peer.status === "removed"
+          ? t("list.removed")
+          : paired
+            ? device?.online
+              ? t("list.online")
+              : t("list.offline")
+            : t("pair.waiting");
+      return {
+        id: peer.deviceId,
+        title: peerName(peer.deviceId),
+        subtitle: archived && !conversation ? statusLabel : previewOf(conversation) || statusLabel,
+        badge: peer.status === "deleted"
+          ? t("list.deleted")
+          : peer.status === "removed"
+            ? t("list.removed")
+            : paired
+              ? t("list.friend")
+              : t("list.pending"),
+        archived,
+        online: Boolean(device?.online && paired),
+        ts: conversation?.ts ?? 0,
+        unread: Boolean(
+          conversation &&
+            conversation.direction === "in" &&
+            conversation.ts * 1000 > (lastRead.value[peer.deviceId] ?? 0),
+        ),
+      };
+    }),
+);
+
+const pairedContacts = computed(() =>
+  contactRows.value.filter(
+    (row) => peers.value.find((peer) => peer.deviceId === row.id)?.status === "paired",
+  ),
+);
+
+const groupRows = computed(() =>
+  groups.value.map((group) => {
+    const conversation = conversations.value[group.group_id];
     return {
-      id: peer.deviceId,
-      title: peerName(peer.deviceId),
-      subtitle: paired
-        ? device?.online
-          ? t("list.online")
-          : t("list.offline")
-        : t("pair.waiting"),
-      badge: paired ? t("list.friend") : t("list.pending"),
-      online: Boolean(device?.online && paired),
+      id: group.group_id,
+      title: group.name,
+      subtitle: previewOf(conversation) || t("list.members", { n: group.members.length }),
+      badge: t("list.group"),
+      archived: false,
+      online: false,
+      ts: conversation?.ts ?? 0,
+      unread: Boolean(
+        conversation &&
+          conversation.direction === "in" &&
+          conversation.ts * 1000 > (lastRead.value[group.group_id] ?? 0),
+      ),
     };
   }),
 );
 
-const pairedContacts = computed(() => contactRows.value.filter((row) => peers.value.find((peer) => peer.deviceId === row.id)?.status === "paired"));
-
-const groupRows = computed(() =>
-  groups.value.map((group) => ({
-    id: group.group_id,
-    title: group.name,
-    subtitle: t("list.members", { n: group.members.length }),
-    badge: t("list.group"),
-    online: false,
-  })),
+const rows = computed(() =>
+  [...contactRows.value, ...groupRows.value].sort((left, right) => right.ts - left.ts),
 );
-
-const rows = computed(() => [...contactRows.value, ...groupRows.value]);
 const isEmpty = computed(() => !pending.value.length && !rows.value.length);
 
 const activeTitle = computed(() => {
@@ -109,13 +160,95 @@ const activeTitle = computed(() => {
 const activeSubtitle = computed(() => {
   if (activeGroup.value) return t("list.members", { n: activeGroup.value.members.length });
   if (!activePeer.value) return "";
+  if (activePeer.value.status === "deleted") return t("list.deleted");
+  if (activePeer.value.status === "removed") return t("list.removed");
   if (activePeer.value.status !== "paired") return t("pair.waiting");
   return deviceMap.value[activePeer.value.deviceId]?.online ? t("list.online") : t("list.offline");
 });
 
+function readStoreKey(): string {
+  return `kite.lastRead.${status.value?.deviceId ?? "unknown"}`;
+}
+
+function namesStoreKey(): string {
+  return `kite.names.${status.value?.deviceId ?? "unknown"}`;
+}
+
+function loadNameCache() {
+  try {
+    nameCache.value = JSON.parse(localStorage.getItem(namesStoreKey()) ?? "{}");
+  } catch {
+    nameCache.value = {};
+  }
+}
+
+function rememberNames(devices: DeviceInfo[]) {
+  let changed = false;
+  const next = { ...nameCache.value };
+  for (const device of devices) {
+    if (device.name && next[device.device_id] !== device.name) {
+      next[device.device_id] = device.name;
+      changed = true;
+    }
+  }
+  if (changed) {
+    nameCache.value = next;
+    try {
+      localStorage.setItem(namesStoreKey(), JSON.stringify(next));
+    } catch {
+      // best effort
+    }
+  }
+}
+
+function loadLastRead() {
+  try {
+    lastRead.value = JSON.parse(localStorage.getItem(readStoreKey()) ?? "{}");
+  } catch {
+    lastRead.value = {};
+  }
+}
+
+function markRead(peer: string) {
+  lastRead.value = { ...lastRead.value, [peer]: Date.now() };
+  try {
+    localStorage.setItem(readStoreKey(), JSON.stringify(lastRead.value));
+  } catch {
+    // storage is best effort
+  }
+}
+
+function previewOf(conversation: Conversation | undefined): string {
+  if (!conversation) return "";
+  if (conversation.kind === "file" || conversation.kind === "file_offer") {
+    return `${t("list.previewFile")} ${conversation.text}`;
+  }
+  return conversation.text;
+}
+
+function formatListTime(ts: number | undefined): string {
+  if (!ts) return "";
+  const date = new Date(ts * 1000);
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) {
+    return date.toLocaleTimeString(locale.value === "zh" ? "zh-CN" : "en", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+  return `${date.getMonth() + 1}/${date.getDate()}`;
+}
+
 function reload() {
   window.location.reload();
 }
+
+const activeArchived = computed(() => {
+  if (!activePeer.value) return null;
+  if (activePeer.value.status === "deleted") return "deleted";
+  if (activePeer.value.status === "removed") return "removed";
+  return null;
+});
 
 function showToast(message: string) {
   toast.value = message;
@@ -148,6 +281,8 @@ async function bootstrap() {
     return;
   }
   accounts.value = await api.accounts().catch(() => []);
+  loadNameCache();
+  loadLastRead();
   await refreshLists();
   startPolling();
 }
@@ -158,6 +293,8 @@ async function afterAuth(next: Status) {
   onboardingServer.value = "";
   applyTheme();
   accounts.value = await api.accounts().catch(() => []);
+  loadNameCache();
+  loadLastRead();
   pending.value = [];
   activeId.value = null;
   messages.value = [];
@@ -167,14 +304,23 @@ async function afterAuth(next: Status) {
 
 async function refreshLists() {
   if (!status.value?.registered) return;
-  const [peersResult, groupsResult, devicesResult] = await Promise.allSettled([
-    api.listPeers(),
+  const [peersResult, groupsResult, devicesResult, conversationsResult] = await Promise.allSettled([
+    api.listContacts(),
     api.listGroups(),
     api.listDevices(),
+    api.conversations(),
   ]);
   if (peersResult.status === "fulfilled") peers.value = peersResult.value;
   if (groupsResult.status === "fulfilled") groups.value = groupsResult.value;
-  if (devicesResult.status === "fulfilled") devices.value = devicesResult.value;
+  if (devicesResult.status === "fulfilled") {
+    devices.value = devicesResult.value;
+    rememberNames(devices.value);
+  }
+  if (conversationsResult.status === "fulfilled") {
+    const map: Record<string, Conversation> = {};
+    for (const conversation of conversationsResult.value) map[conversation.peer] = conversation;
+    conversations.value = map;
+  }
   for (const peer of peers.value) {
     if (
       peer.status === "pending_accept" &&
@@ -194,6 +340,7 @@ async function refreshLists() {
 
 async function select(id: string) {
   activeId.value = id;
+  markRead(id);
   try {
     messages.value = await api.history(id);
   } catch (error) {
@@ -308,7 +455,8 @@ async function removeContact() {
   if (!peer) return;
   confirming.value = null;
   try {
-    await api.unpair(peer.deviceId);
+    await api.removeContact(peer.deviceId);
+    delete conversations.value[peer.deviceId];
     activeId.value = null;
     messages.value = [];
     await refreshLists();
@@ -483,6 +631,46 @@ function openAddAccount() {
   showOnboarding.value = true;
 }
 
+async function checkShare() {
+  if (!status.value?.registered) return;
+  try {
+    const share = await api.takeShare();
+    if (share) pendingShare.value = share;
+  } catch (error) {
+    console.warn("share check failed", error);
+  }
+}
+
+async function sendShare(target: string) {
+  const share = pendingShare.value;
+  if (!share || shareBusy.value) return;
+  const group = groups.value.some((item) => item.group_id === target);
+  if (group && share.files.length) {
+    showToast(t("share.groupFiles"));
+    return;
+  }
+  shareBusy.value = true;
+  try {
+    if (!group) {
+      for (const file of share.files) {
+        await api.sendFile(target, file.path);
+      }
+    }
+    if (share.text?.trim()) {
+      const text = share.text.trim();
+      if (group) await api.sendGroupMessage(target, text);
+      else await api.sendMessage(target, text);
+    }
+    pendingShare.value = null;
+    await refreshLists();
+    await select(target);
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    shareBusy.value = false;
+  }
+}
+
 onMounted(async () => {
   isMobile.value = window.matchMedia("(max-width: 760px)").matches;
   window.matchMedia("(max-width: 760px)").addEventListener("change", (event) => {
@@ -522,6 +710,13 @@ onMounted(async () => {
   }
 
   await bootstrap();
+  await checkShare();
+  try {
+    await listen("kite://share", () => void checkShare());
+  } catch {
+    // web-only fallback
+  }
+  window.setInterval(() => void checkShare(), 3000);
 });
 
 onBeforeUnmount(() => {
@@ -598,7 +793,11 @@ onBeforeUnmount(() => {
               {{ row.subtitle }}
             </span>
           </span>
-          <span class="badge">{{ row.badge }}</span>
+          <span class="contact-side">
+            <span class="list-time">{{ formatListTime(row.ts) }}</span>
+            <span v-if="row.unread" class="unread-dot" />
+            <span v-else class="badge">{{ row.badge }}</span>
+          </span>
         </button>
 
         <div v-if="isEmpty" class="list-empty">
@@ -628,6 +827,9 @@ onBeforeUnmount(() => {
         </div>
       </header>
 
+      <div v-if="activeArchived" class="readonly-banner">
+        {{ t(activeArchived === "deleted" ? "chat.readOnlyDeleted" : "chat.readOnlyRemoved") }}
+      </div>
       <div ref="scroller" class="messages">
         <div v-if="!messages.length" class="chat-empty">{{ t("chat.empty") }}</div>
         <MessageItem
@@ -641,7 +843,7 @@ onBeforeUnmount(() => {
         />
       </div>
 
-      <footer class="composer">
+      <footer v-if="!activeArchived" class="composer">
         <button
           class="icon attach"
           :title="t('chat.attach')"
@@ -670,6 +872,36 @@ onBeforeUnmount(() => {
     <input ref="fileInput" type="file" class="hidden-input" @change="onFilePicked" />
     <div v-if="dragOver" class="drop-overlay">{{ t("chat.attach") }}</div>
     <div v-if="toast" class="toast">{{ toast }}</div>
+
+    <div v-if="pendingShare" class="sheet-mask" @click.self="pendingShare = null">
+      <div class="sheet">
+        <header class="sheet-header">
+          <h2>{{ t("share.title") }}</h2>
+          <button class="icon" @click="pendingShare = null">×</button>
+        </header>
+        <section class="sheet-section">
+          <p class="muted small">
+            {{ pendingShare.files.length ? pendingShare.files.map((file) => file.name).join(", ") : pendingShare.text }}
+          </p>
+          <p v-if="!pairedContacts.length && !groupRows.length" class="muted small">{{ t("share.empty") }}</p>
+          <button
+            v-for="row in [...pairedContacts, ...groupRows]"
+            :key="`share-${row.id}`"
+            class="device-row"
+            :disabled="shareBusy"
+            @click="sendShare(row.id)"
+          >
+            <span class="avatar" :class="{ group: groupRows.some((group) => group.id === row.id) }">
+              {{ row.title.slice(0, 1).toUpperCase() }}
+            </span>
+            <span class="device-meta">
+              <strong>{{ row.title }}</strong>
+              <span class="muted small">{{ row.badge }}</span>
+            </span>
+          </button>
+        </section>
+      </div>
+    </div>
 
     <SettingsSheet
       v-if="showSettings && status"

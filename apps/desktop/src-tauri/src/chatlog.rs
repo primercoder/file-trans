@@ -19,6 +19,16 @@ pub struct ChatRecord {
     pub ts: i64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Conversation {
+    pub peer: String,
+    pub text: String,
+    pub kind: String,
+    pub direction: String,
+    pub ts: i64,
+}
+
 pub struct ChatLog {
     path: PathBuf,
 }
@@ -38,6 +48,67 @@ impl ChatLog {
             .open(&self.path)
             .map_err(|e| e.to_string())?;
         file.write_all(&line).map_err(|e| e.to_string())
+    }
+
+    /// Deletes every local message for one peer (manual contact removal).
+    pub fn remove_peer(&self, peer: &str) -> Result<(), String> {
+        let Ok(bytes) = std::fs::read(&self.path) else {
+            return Ok(());
+        };
+        let mut kept = Vec::with_capacity(bytes.len());
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let keep = match serde_json::from_slice::<ChatRecord>(line) {
+                Ok(record) => record.peer != peer,
+                Err(_) => true,
+            };
+            if keep {
+                kept.extend_from_slice(line);
+                kept.push(b'\n');
+            }
+        }
+        let temporary = self.path.with_extension("jsonl.tmp");
+        std::fs::write(&temporary, kept).map_err(|error| error.to_string())?;
+        std::fs::rename(&temporary, &self.path).map_err(|error| error.to_string())
+    }
+
+    /// Last message per peer, for the conversation list.
+    pub fn conversations(&self) -> Result<Vec<Conversation>, String> {
+        let Ok(bytes) = std::fs::read(&self.path) else {
+            return Ok(Vec::new());
+        };
+        let mut latest: std::collections::BTreeMap<String, Conversation> = Default::default();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_slice::<ChatRecord>(line) else {
+                continue;
+            };
+            let replace = latest
+                .get(&record.peer)
+                .is_none_or(|current| record.ts >= current.ts);
+            if replace {
+                latest.insert(
+                    record.peer.clone(),
+                    Conversation {
+                        peer: record.peer,
+                        text: match record.kind.as_str() {
+                            "system" => String::new(),
+                            _ => record.text,
+                        },
+                        kind: record.kind,
+                        direction: record.direction,
+                        ts: record.ts,
+                    },
+                );
+            }
+        }
+        let mut conversations: Vec<Conversation> = latest.into_values().collect();
+        conversations.sort_by(|left, right| right.ts.cmp(&left.ts));
+        Ok(conversations)
     }
 
     pub fn history(&self, peer: &str, limit: usize) -> Result<Vec<ChatRecord>, String> {

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/allfiles;
+Actions=KiteSend;
+Icon=kite
+X-KDE-Priority=TopLevel
+
+[Desktop Action KiteSend]
+Name=Send with Kite
+Name[zh_CN]=通过 Kite 发送
+Icon=kite
+Exec=kite-desktop --share %F

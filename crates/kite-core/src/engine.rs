@@ -410,6 +410,7 @@ impl Engine {
         self.store
             .save_session(peer, &bincode::serialize(&session)?, "paired")?;
         self.store.remove_pending(peer)?;
+        self.store.delete_archived(peer)?;
         Ok(())
     }
 
@@ -445,6 +446,21 @@ impl Engine {
         Ok(self
             .peer_identity(peer)?
             .map(|key| crate::safety_number(&self.identity.ed25519_public_key(), &key)))
+    }
+
+    /// Every contact known locally: active sessions first, then archived peers
+    /// that removed this device or deleted their account (read-only history).
+    pub fn contacts(&self) -> Result<Vec<(String, String)>> {
+        let mut rows = self.store.contacts()?;
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows)
+    }
+
+    /// Removes a contact and the archived marker (used for manual deletion).
+    pub async fn delete_contact(&mut self, peer: &str) -> Result<()> {
+        self.unpair(peer).await?;
+        self.store.delete_archived(peer)?;
+        Ok(())
     }
 
     /// Removes a paired contact locally and tells the peer when possible.
@@ -494,6 +510,7 @@ impl Engine {
                 peer: from.to_owned(),
             }),
             remove_session: Some(from.to_owned()),
+            archive_contact: Some((from.to_owned(), "removed".into())),
             ..EntryOutcome::default()
         })
     }
@@ -979,7 +996,7 @@ impl Engine {
             "msg" => self.receive_message(&entry.from, &entry.payload),
             "file" => self.receive_file_offer(&entry.from, &entry.payload),
             "file_evicted" => receive_file_unavailable(&entry.payload),
-            "notice" => receive_notice(entry),
+            "notice" => self.receive_notice(entry),
             "unpair" => self.receive_unpair(&entry.from, &entry.payload),
             "group_key" => self.receive_group_key(&entry.from, &entry.payload),
             "group_msg" => self.receive_group_message(entry),
@@ -1312,30 +1329,38 @@ impl Engine {
 /// Server-authored eviction notices are unauthenticated plaintext JSON, not peer
 /// ciphertext. They are advisory hints only: they never alter pending-file state,
 /// authorize a download, or prove that an eviction actually occurred.
-/// Server-authored notices are the only entries accepted from `server`.
-fn receive_notice(entry: &crate::api_client::MailEntry) -> Result<EntryOutcome> {
-    if entry.from != "server" {
-        return Err(EngineError::Protocol("notice must come from server".into()));
-    }
-    let body: serde_json::Value = serde_json::from_slice(&B64.decode(&entry.payload)?)?;
-    match body["event"].as_str() {
-        Some("devices_changed") => Ok(EntryOutcome {
-            event: Some(InboxEvent::DevicesChanged),
-            ..EntryOutcome::default()
-        }),
-        Some("device_deleted") => {
-            let Some(device_id) = body["device_id"].as_str() else {
-                return Err(EngineError::Protocol("device_deleted without id".into()));
-            };
-            Ok(EntryOutcome {
-                event: Some(InboxEvent::PeerDeleted {
-                    peer: device_id.to_owned(),
-                }),
-                remove_session: Some(device_id.to_owned()),
-                ..EntryOutcome::default()
-            })
+impl Engine {
+    /// Server-authored notices are the only entries accepted from `server`.
+    ///
+    /// A deleted account only becomes an archived contact when this device knew
+    /// it; unrelated deletions stay invisible.
+    fn receive_notice(&self, entry: &crate::api_client::MailEntry) -> Result<EntryOutcome> {
+        if entry.from != "server" {
+            return Err(EngineError::Protocol("notice must come from server".into()));
         }
-        _ => Err(EngineError::Protocol("unknown notice".into())),
+        let body: serde_json::Value = serde_json::from_slice(&B64.decode(&entry.payload)?)?;
+        match body["event"].as_str() {
+            Some("devices_changed") => Ok(EntryOutcome {
+                event: Some(InboxEvent::DevicesChanged),
+                ..EntryOutcome::default()
+            }),
+            Some("device_deleted") => {
+                let Some(device_id) = body["device_id"].as_str() else {
+                    return Err(EngineError::Protocol("device_deleted without id".into()));
+                };
+                let known = self.store.session(device_id)?.is_some()
+                    || self.store.archived_status(device_id)?.is_some();
+                Ok(EntryOutcome {
+                    event: known.then(|| InboxEvent::PeerDeleted {
+                        peer: device_id.to_owned(),
+                    }),
+                    remove_session: known.then(|| device_id.to_owned()),
+                    archive_contact: known.then(|| (device_id.to_owned(), "deleted".into())),
+                    ..EntryOutcome::default()
+                })
+            }
+            _ => Err(EngineError::Protocol("unknown notice".into())),
+        }
     }
 }
 

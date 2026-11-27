@@ -45,6 +45,24 @@ export interface ChatView {
   ts: number;
 }
 
+export interface Conversation {
+  peer: string;
+  text: string;
+  kind: string;
+  direction: string;
+  ts: number;
+}
+
+export interface ShareFile {
+  path: string;
+  name: string;
+}
+
+export interface SharePayload {
+  text: string | null;
+  files: ShareFile[];
+}
+
 export interface PollResult {
   messages: ChatView[];
   devicesChanged: boolean;

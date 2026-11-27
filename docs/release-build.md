@@ -68,6 +68,12 @@ npx tauri build          # 产出 kite-desktop、deb、rpm、AppImage
 - `dist/linux/kite-0.1.0-x86_64.AppImage`
 - `dist/linux/kite-0.1.0-linux-x64-portable.tar.gz`（`kite-desktop` + `README.txt`）
 
+Linux 安装包还需要文件管理器集成（KDE 服务菜单、Nautilus 脚本）：
+
+```bash
+./scripts/add_desktop_integration.sh target/release/bundle/deb/Kite_0.1.0_amd64.deb
+```
+
 若 Tauri 打包 AppImage 时无法下载 AppRun，可手工打包：
 
 ```bash
@@ -93,7 +99,8 @@ cargo build --release
 makensis -DSOURCE_EXE=/path/to/kite-desktop.exe scripts/windows-installer.nsi
 ```
 
-安装包行为：安装到 `%ProgramFiles%\Kite`，创建公共桌面与开始菜单快捷方式，写入"应用和功能"卸载项；
+安装包行为：安装到 `%ProgramFiles%\Kite`，创建公共桌面与开始菜单快捷方式，写入"应用和功能"卸载项，
+并注册资源管理器右键菜单 `Send with Kite`（`--share "%1"`，单实例转发给已运行的窗口）；
 支持 `/S` 静默安装与 `uninstall.exe /S` 静默卸载。
 
 ## 4. Android

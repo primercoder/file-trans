@@ -58,6 +58,10 @@ Section "Kite" SecMain
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Kite" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Kite" "NoModify" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Kite" "NoRepair" 1
+  ; Explorer context menu: "Send with Kite" for files.
+  WriteRegStr HKLM "Software\Classes\*\shell\KiteSend" "" "Send with Kite"
+  WriteRegStr HKLM "Software\Classes\*\shell\KiteSend" "Icon" "$INSTDIR\kite-desktop.exe"
+  WriteRegStr HKLM "Software\Classes\*\shell\KiteSend\command" "" '"$INSTDIR\kite-desktop.exe" --share "%1"'
 SectionEnd
 
 Section "Uninstall"
@@ -69,4 +73,5 @@ Section "Uninstall"
   RMDir /r "$INSTDIR"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Kite"
   DeleteRegKey HKLM "Software\Kite"
+  DeleteRegKey HKLM "Software\Classes\*\shell\KiteSend"
 SectionEnd
